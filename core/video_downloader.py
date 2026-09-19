@@ -1,4 +1,4 @@
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 from core import item_reasons
 from core.downloader_base import BaseDownloader, DownloadResult
@@ -29,7 +29,10 @@ class VideoDownloader(BaseDownloader):
 
         await self.rate_limiter.acquire()
 
-        aweme_data = await self.api_client.get_video_detail(aweme_id)
+        aweme_data = await self._get_aweme_detail(
+            str(aweme_id),
+            content_type=str(parsed_url.get("type") or "video"),
+        )
         if not aweme_data:
             logger.error("Failed to get video detail: %s", aweme_id)
             result.failed += 1
@@ -58,6 +61,35 @@ class VideoDownloader(BaseDownloader):
             self._progress_advance_item("failed", str(aweme_id))
 
         return result
+
+    async def _get_aweme_detail(
+        self, aweme_id: str, *, content_type: str = "video"
+    ) -> Optional[Dict[str, Any]]:
+        detail = await self.api_client.get_video_detail(aweme_id)
+        if detail:
+            return detail
+
+        browser_cfg = self.config.get("browser_fallback", {}) or {}
+        if not browser_cfg.get("enabled", True):
+            return None
+        browser_fetcher = getattr(self.api_client, "get_video_detail_via_browser", None)
+        if not callable(browser_fetcher):
+            return None
+
+        self._progress_update_step("浏览器回补", "直连接口受限，打开作品页面获取详情")
+        logger.warning("Video detail API unavailable, starting browser fallback: %s", aweme_id)
+        try:
+            return await browser_fetcher(
+                aweme_id,
+                page_type="note" if content_type in {"gallery", "note"} else "video",
+                headless=bool(browser_cfg.get("headless", False)),
+                wait_timeout_seconds=int(
+                    browser_cfg.get("wait_timeout_seconds", 600) or 600
+                ),
+            )
+        except Exception as exc:
+            logger.warning("Video browser fallback failed for %s: %s", aweme_id, exc)
+            return None
 
     async def _collect_comments_for_existing_video(self, aweme_data: Dict[str, Any]) -> bool:
         author = aweme_data.get("author", {}) or {}

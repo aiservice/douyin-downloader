@@ -279,6 +279,21 @@ def test_get_save_path_collection_dir_group_by_mode_false(tmp_path):
     assert "mix" not in path.parts
 
 
+def test_get_save_path_output_root_bypasses_author_and_mode(tmp_path):
+    fm = FileManager(str(tmp_path))
+
+    path = fm.get_save_path(
+        "作者",
+        mode="mix",
+        folderstyle=True,
+        folder_name="第001集：开场",
+        collection_dir="合集",
+        output_root="mix_大宅门_123",
+    )
+
+    assert path == tmp_path / "mix_大宅门_123" / "第001集：开场"
+
+
 def test_get_save_path_author_dir_user_sec_uid(tmp_path):
     """``user_sec_uid`` style prefixes the sec_uid with ``user_`` to match the
     legacy DouYin-Downloader on-disk layout."""

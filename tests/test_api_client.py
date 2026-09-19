@@ -192,6 +192,106 @@ def test_homepage_screenshot_playwright_captures_viewport(tmp_path, monkeypatch)
     assert captured["browser_closed"] is True
 
 
+def test_video_browser_fallback_collects_page_owned_detail(monkeypatch):
+    aweme_id = "7670322988125785387"
+    detail = {
+        "aweme_id": aweme_id,
+        "desc": "browser detail",
+        "author": {"nickname": "author"},
+        "video": {"play_addr": {"url_list": ["https://example.com/video.mp4"]}},
+    }
+    captured = {"cookies": []}
+
+    class _FakeResponse:
+        url = (
+            "https://www.douyin.com/aweme/v1/web/aweme/detail/"
+            f"?aweme_id={aweme_id}"
+        )
+
+        async def json(self):
+            return {"status_code": 0, "aweme_detail": detail}
+
+    class _FakePage:
+        url = f"https://www.douyin.com/video/{aweme_id}"
+
+        def __init__(self):
+            self._response_handler = None
+
+        def on(self, event_name, callback):
+            if event_name == "response":
+                self._response_handler = callback
+
+        async def goto(self, *_args, **_kwargs):
+            self._response_handler(_FakeResponse())
+
+        async def title(self):
+            return "作品 - 抖音"
+
+        async def evaluate(self, _script, *_args):
+            return ""
+
+        def is_closed(self):
+            return False
+
+        async def wait_for_timeout(self, _milliseconds):
+            return None
+
+    class _FakeContext:
+        async def add_cookies(self, cookies):
+            captured["cookies"].extend(cookies)
+
+        async def new_page(self):
+            return _FakePage()
+
+        async def cookies(self, _base_url):
+            return []
+
+        async def close(self):
+            captured["context_closed"] = True
+
+    class _FakeBrowser:
+        async def new_context(self, **kwargs):
+            captured["context"] = kwargs
+            return _FakeContext()
+
+        async def close(self):
+            captured["browser_closed"] = True
+
+    class _FakeChromium:
+        executable_path = ""
+
+        async def launch(self, **_kwargs):
+            return _FakeBrowser()
+
+    class _FakeManager:
+        async def __aenter__(self):
+            return types.SimpleNamespace(chromium=_FakeChromium())
+
+        async def __aexit__(self, *_args):
+            return None
+
+    fake_playwright_pkg = types.ModuleType("playwright")
+    fake_async_api = types.ModuleType("playwright.async_api")
+    fake_async_api.async_playwright = lambda: _FakeManager()
+    monkeypatch.setitem(sys.modules, "playwright", fake_playwright_pkg)
+    monkeypatch.setitem(sys.modules, "playwright.async_api", fake_async_api)
+
+    client = DouyinAPIClient({"msToken": "token", "sessionid_ss": "session-cookie"})
+    result = asyncio.run(
+        client.get_video_detail_via_browser(
+            aweme_id,
+            headless=False,
+            wait_timeout_seconds=30,
+        )
+    )
+
+    assert result == detail
+    assert "user_agent" not in captured["context"]
+    assert any(cookie["name"] == "sessionid_ss" for cookie in captured["cookies"])
+    assert captured["context_closed"] is True
+    assert captured["browser_closed"] is True
+
+
 def test_browser_fallback_caps_warmup_wait(monkeypatch):
     class _FakeMouse:
         async def wheel(self, _x, _y):
@@ -238,8 +338,10 @@ def test_browser_fallback_caps_warmup_wait(monkeypatch):
     class _FakeBrowser:
         def __init__(self, context):
             self._context = context
+            self.context_kwargs = None
 
-        async def new_context(self, **_kwargs):
+        async def new_context(self, **kwargs):
+            self.context_kwargs = kwargs
             return self._context
 
         async def close(self):
@@ -304,6 +406,331 @@ def test_browser_fallback_caps_warmup_wait(monkeypatch):
     stats = client.pop_browser_post_stats()
     assert stats["selected_ids"] == 0
     assert client.pop_browser_post_stats() == {}
+
+
+def test_post_browser_limit_uses_filtered_candidates(monkeypatch):
+    first = {"aweme_id": "7670000000000000001", "create_time": 500}
+    second = {"aweme_id": "7670000000000000002", "create_time": 300}
+
+    class _FakeResponse:
+        def __init__(self, item):
+            self.url = "https://www.douyin.com/aweme/v1/web/aweme/post/"
+            self._item = item
+
+        async def json(self):
+            return {"status_code": 0, "aweme_list": [self._item], "has_more": 1}
+
+    class _FakeMouse:
+        def __init__(self, page):
+            self.page = page
+            self.scrolls = 0
+
+        async def wheel(self, _x, _y):
+            self.scrolls += 1
+            if self.scrolls == 1:
+                self.page._response_handler(_FakeResponse(second))
+
+    class _FakePage:
+        url = "https://www.douyin.com/user/sec_uid_x"
+
+        def __init__(self):
+            self._response_handler = None
+            self.mouse = _FakeMouse(self)
+
+        def on(self, event_name, callback):
+            if event_name == "response":
+                self._response_handler = callback
+
+        async def goto(self, *_args, **_kwargs):
+            self._response_handler(_FakeResponse(first))
+
+        async def title(self):
+            return "作者主页"
+
+        async def evaluate(self, _script):
+            return ""
+
+        def is_closed(self):
+            return False
+
+        async def wait_for_timeout(self, _milliseconds):
+            await asyncio.sleep(0)
+
+    class _FakeContext:
+        def __init__(self, page):
+            self.page = page
+
+        async def add_cookies(self, _cookies):
+            return None
+
+        async def new_page(self):
+            return self.page
+
+        async def cookies(self, _base_url):
+            return []
+
+        async def close(self):
+            return None
+
+    class _FakeBrowser:
+        def __init__(self, page):
+            self.page = page
+
+        async def new_context(self, **_kwargs):
+            return _FakeContext(self.page)
+
+        async def close(self):
+            return None
+
+    class _FakeChromium:
+        executable_path = ""
+
+        def __init__(self, page):
+            self.page = page
+
+        async def launch(self, **_kwargs):
+            return _FakeBrowser(self.page)
+
+    class _FakeManager:
+        def __init__(self, page):
+            self.page = page
+
+        async def __aenter__(self):
+            return types.SimpleNamespace(chromium=_FakeChromium(self.page))
+
+        async def __aexit__(self, *_args):
+            return None
+
+    page = _FakePage()
+    fake_playwright_pkg = types.ModuleType("playwright")
+    fake_async_api = types.ModuleType("playwright.async_api")
+    fake_async_api.async_playwright = lambda: _FakeManager(page)
+    monkeypatch.setitem(sys.modules, "playwright", fake_playwright_pkg)
+    monkeypatch.setitem(sys.modules, "playwright.async_api", fake_async_api)
+
+    client = DouyinAPIClient({"msToken": "token"})
+
+    async def _no_dom_ids(_page):
+        return []
+
+    monkeypatch.setattr(client, "_extract_aweme_ids_from_page", _no_dom_ids)
+    ids = asyncio.run(
+        client.collect_user_post_ids_via_browser(
+            "sec_uid_x",
+            expected_count=1,
+            candidate_filter=lambda items: [
+                item for item in items if int(item.get("create_time") or 0) <= 300
+            ],
+            headless=True,
+            max_scrolls=5,
+            idle_rounds=2,
+            wait_timeout_seconds=30,
+        )
+    )
+
+    assert ids == [first["aweme_id"], second["aweme_id"]]
+    assert page.mouse.scrolls == 1
+    stats = client.pop_browser_post_stats()
+    assert stats["candidate_items"] == 1
+
+
+def test_mix_browser_fallback_collects_page_owned_responses(monkeypatch):
+    item_1 = {"aweme_id": "7600224486650121888", "desc": "one"}
+    item_2 = {"aweme_id": "7600224486650121889", "desc": "two"}
+    captured_cookies = []
+
+    class _FakeResponse:
+        def __init__(self, url, data):
+            self.url = url
+            self._data = data
+
+        async def json(self):
+            return self._data
+
+    class _FakeMouse:
+        async def wheel(self, _x, _y):
+            return
+
+    class _FakePage:
+        def __init__(self):
+            self.mouse = _FakeMouse()
+            self._response_handler = None
+            self.url = "https://www.douyin.com/collection/123"
+
+        def on(self, event_name, callback):
+            if event_name == "response":
+                self._response_handler = callback
+
+        async def goto(self, *_args, **_kwargs):
+            base = "https://www.douyin.com/aweme/v1/web"
+            self._response_handler(
+                _FakeResponse(
+                    f"{base}/mix/detail/?mix_id=123",
+                    {
+                        "status_code": 0,
+                        "mix_info": {
+                            "mix_name": "浏览器合集",
+                            "author": {"nickname": "author"},
+                        },
+                    },
+                )
+            )
+            self._response_handler(
+                _FakeResponse(
+                    f"{base}/series/aweme/?series_id=123&cursor=0",
+                    {"status_code": 0, "aweme_list": [item_1], "has_more": 1},
+                )
+            )
+            self._response_handler(
+                _FakeResponse(
+                    f"{base}/series/aweme/?series_id=123&cursor=1",
+                    {
+                        "status_code": 0,
+                        "aweme_list": [item_1, item_2],
+                        "has_more": 0,
+                    },
+                )
+            )
+
+        async def title(self):
+            return "浏览器合集 - 抖音"
+
+        def is_closed(self):
+            return False
+
+        async def wait_for_timeout(self, _ms):
+            await asyncio.sleep(0)
+
+    class _FakeContext:
+        def __init__(self, page):
+            self._page = page
+
+        async def add_cookies(self, _cookies):
+            captured_cookies.extend(_cookies)
+
+        async def new_page(self):
+            return self._page
+
+        async def cookies(self, _base_url):
+            return []
+
+        async def close(self):
+            return
+
+    class _FakeBrowser:
+        def __init__(self, context):
+            self._context = context
+            self.context_kwargs = None
+
+        async def new_context(self, **kwargs):
+            self.context_kwargs = kwargs
+            return self._context
+
+        async def close(self):
+            return
+
+    class _FakeChromium:
+        executable_path = ""
+
+        def __init__(self, browser):
+            self._browser = browser
+
+        async def launch(self, **_kwargs):
+            return self._browser
+
+    class _FakePlaywrightManager:
+        def __init__(self, browser):
+            self._playwright = types.SimpleNamespace(chromium=_FakeChromium(browser))
+
+        async def __aenter__(self):
+            return self._playwright
+
+        async def __aexit__(self, *_args):
+            return
+
+    page = _FakePage()
+    browser = _FakeBrowser(_FakeContext(page))
+    manager = _FakePlaywrightManager(browser)
+    fake_playwright_pkg = types.ModuleType("playwright")
+    fake_async_api = types.ModuleType("playwright.async_api")
+    fake_async_api.async_playwright = lambda: manager
+    monkeypatch.setitem(sys.modules, "playwright", fake_playwright_pkg)
+    monkeypatch.setitem(sys.modules, "playwright.async_api", fake_async_api)
+
+    client = DouyinAPIClient({"msToken": "token-1", "sessionid_ss": "session-cookie"})
+    result = asyncio.run(
+        client.collect_mix_aweme_via_browser(
+            "123", headless=False, max_scrolls=2, idle_rounds=1, wait_timeout_seconds=30
+        )
+    )
+
+    assert [item["aweme_id"] for item in result["items"]] == [
+        "7600224486650121888",
+        "7600224486650121889",
+    ]
+    assert result["mix_detail"]["mix_name"] == "浏览器合集"
+    assert result["complete"] is True
+    assert result["pages"] == 2
+    assert "user_agent" not in browser.context_kwargs
+    assert any(cookie["name"] == "sessionid_ss" for cookie in captured_cookies)
+
+
+def test_mix_browser_fallback_dismisses_save_login_prompt():
+    clicks = []
+
+    class _Locator:
+        def __init__(self, *, present=True):
+            self.present = present
+
+        @property
+        def first(self):
+            return self
+
+        async def count(self):
+            return 1 if self.present else 0
+
+        async def is_visible(self):
+            return self.present
+
+        async def click(self, **kwargs):
+            clicks.append(kwargs)
+
+    class _Page:
+        def get_by_text(self, text, exact=False):
+            return _Locator(present=text in {"是否保存登录信息", "取消"})
+
+    client = DouyinAPIClient({"msToken": "token-1"})
+    dismissed = asyncio.run(client._dismiss_browser_interstitials(_Page()))
+
+    assert dismissed is True
+    assert clicks == [{"timeout": 5_000, "force": True}]
+
+
+def test_manual_verification_waits_until_blocker_disappears(monkeypatch):
+    class _Page:
+        def __init__(self):
+            self.waits = 0
+
+        def is_closed(self):
+            return False
+
+        async def wait_for_timeout(self, _milliseconds):
+            self.waits += 1
+
+    client = DouyinAPIClient({"msToken": "token-1"})
+    reasons = iter(["安全验证", ""])
+
+    async def _reason(_page):
+        return next(reasons)
+
+    monkeypatch.setattr(client, "_browser_verification_reason", _reason)
+    page = _Page()
+    cleared = asyncio.run(
+        client._wait_for_manual_verification(page, wait_timeout_seconds=30)
+    )
+
+    assert cleared is True
+    assert page.waits == 1
 
 
 @pytest.mark.asyncio

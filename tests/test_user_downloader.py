@@ -2,6 +2,7 @@ import asyncio
 import errno
 import logging
 import sys
+from datetime import datetime
 from typing import Any, Dict, List
 
 import pytest
@@ -125,6 +126,8 @@ def _build_downloader(
     homepage_screenshot: bool = False,
     author_dir: str = "nickname",
     increase_post: bool = True,
+    start_time: str = "",
+    end_time: str = "",
 ) -> UserDownloader:
     config_data = {
         "number": {"post": number_post},
@@ -134,6 +137,8 @@ def _build_downloader(
         "author_url": author_url,
         "homepage_screenshot": homepage_screenshot,
         "author_dir": author_dir,
+        "start_time": start_time,
+        "end_time": end_time,
         "browser_fallback": {
             "enabled": browser_enabled,
             "headless": True,
@@ -318,6 +323,41 @@ def test_user_post_browser_fallback_expected_count_uses_number_limit(tmp_path, m
     assert api_client.browser_call_kwargs[0].get("expected_count") == 2
 
 
+def test_user_post_browser_limit_counts_time_filtered_candidates(tmp_path, monkeypatch):
+    api_client = _FakeAPIClient()
+    downloader = _build_downloader(
+        tmp_path,
+        api_client,
+        browser_enabled=True,
+        number_post=2,
+        start_time="2023-11-14",
+        end_time="2023-11-14",
+    )
+
+    async def _always_true(*_args, **_kwargs):
+        return True
+
+    monkeypatch.setattr(downloader, "_should_download", _always_true)
+    monkeypatch.setattr(downloader, "_download_aweme_assets", _always_true)
+
+    asyncio.run(
+        downloader._download_user_post(
+            "sec_uid_x",
+            {"uid": "uid-1", "nickname": "tester", "aweme_count": 999},
+        )
+    )
+
+    kwargs = api_client.browser_call_kwargs[0]
+    candidate_filter = kwargs["candidate_filter"]
+    assert kwargs["expected_count"] == 2
+    assert kwargs["start_ts"] == int(datetime(2023, 11, 14).timestamp())
+    assert [item["aweme_id"] for item in candidate_filter([
+        _make_aweme("pinned", create_time=int(datetime(2023, 11, 14, 10).timestamp()), is_top=1),
+        _make_aweme("too-new", create_time=int(datetime(2023, 11, 15).timestamp())),
+        _make_aweme("in-range", create_time=int(datetime(2023, 11, 14, 12).timestamp())),
+    ])] == ["in-range"]
+
+
 def test_user_post_skips_pinned_before_number_limit(tmp_path, monkeypatch):
     class _PinnedAPIClient(_FakeAPIClient):
         async def get_user_post(self, _sec_uid: str, max_cursor: int = 0, _count: int = 20):
@@ -408,6 +448,48 @@ def test_user_post_reports_step_and_item_progress(tmp_path, monkeypatch):
     assert statuses.count("success") == 1
     assert statuses.count("skipped") == 1
     assert statuses.count("failed") == 1
+
+
+def test_user_episode_template_sorts_oldest_first_and_assigns_numbers(
+    tmp_path, monkeypatch
+):
+    downloader = _build_downloader(
+        tmp_path,
+        _FakeAPIClient(),
+        browser_enabled=False,
+    )
+    downloader.config._data.update(
+        legacy_layout=True,
+        filename_template="{episode_title}",
+        folder_template="{episode_title}",
+    )
+    captured = []
+
+    async def _always_true(*_args, **_kwargs):
+        return True
+
+    async def _capture(item, *_args, **_kwargs):
+        captured.append(
+            (item["aweme_id"], item["_episode_number"], item["_episode_width"])
+        )
+        return True
+
+    monkeypatch.setattr(downloader, "_should_download", _always_true)
+    monkeypatch.setattr(downloader, "_download_aweme_assets", _capture)
+
+    result = asyncio.run(
+        downloader._download_mode_items(
+            "post",
+            [
+                _make_aweme("new", create_time=200),
+                _make_aweme("old", create_time=100),
+            ],
+            "tester",
+        )
+    )
+
+    assert result.success == 2
+    assert captured == [("old", 1, 2), ("new", 2, 2)]
 
 
 def _seed_local_media(tmp_path, aweme_id: str) -> None:

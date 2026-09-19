@@ -28,7 +28,7 @@ _截图来自当前桌面端 `main` 构建；为保护隐私，界面内容使�
 
 ## 功能概览
 
-> **⚠️ 抖音风控升级：CLI 已无法下载点赞 / 收藏夹 / 收藏合集（2026-08 起）以及单个视频 / 图文、合集、音乐（2026-09 起）；用户主页作品只能依赖浏览器兜底。** 原因与仍可用的功能见下方[限制说明](#限制说明)；这些下载请改用桌面版 Douzy。
+> **⚠️ 抖音风控升级：CLI 直连接口已无法下载点赞 / 收藏夹 / 收藏合集（2026-08 起）以及单个视频 / 图文、合集、音乐（2026-09 起）；单个作品、用户主页作品和合集 URL 可安装 Playwright 后走真实浏览器兜底。** 原因与仍可用的功能见下方[限制说明](#限制说明)；其他受限下载请改用桌面版 Douzy。
 
 ### 已支持
 
@@ -71,12 +71,11 @@ _截图来自当前桌面端 `main` 构建；为保护隐私，界面内容使�
   - 2026-09-14 起：`aweme/detail`（单个视频 / 图文）、`aweme/post`（主页作品）、`mix/detail`、`mix/list`、
     `music/detail`、`music/aweme`、`music/list`
 
-  放行所需的 `x-secsdk-web-signature` 只能由抖音网页内的 SDK 生成，CLI 的 API 直连请求无法带上，因此单个视频 / 图文、
-  合集、音乐以及点赞 / 收藏类下载在 CLI 中**无法使用**。主页作品（`post`）的 API 翻页同样被拒；安装 `playwright` 并保持
-  `browser_fallback` 开启（默认有头）时，浏览器兜底读取的是页面自己发出的作品列表请求，可能仍能取到，但尚未针对该门禁实测。
-  桌面版 Douzy 通过内置的登录窗口代发这些请求，不受影响。2026-09-14 实测仍可直连的接口：用户资料、关注列表、
-  评论列表、直播间（webcast）、热搜榜与搜索。
-- 浏览器兜底当前仅针对 `post` 完整验证，`like/mix/music` 主要依赖 API 正常分页
+  放行所需的 `x-secsdk-web-signature` 只能由抖音网页内的 SDK 生成，CLI 的 API 直连请求无法带上。安装 `playwright` 并保持
+  `browser_fallback` 开启（默认有头）时，单个视频 / 图文、主页作品和合集 URL 会打开真实抖音页面，读取页面自身已经签名的响应或页面详情数据。
+  音乐以及点赞 / 收藏类下载仍无法通过 CLI 直连接口使用。桌面版 Douzy 通过内置的登录窗口代发这些请求，
+  不受影响。2026-09-14 实测仍可直连的接口：用户资料、关注列表、评论列表、直播间（webcast）、热搜榜与搜索。
+- 浏览器兜底覆盖单个视频 / 图文、主页作品（`post`）和直接输入的合集 URL；`like/music/collect/collectmix` 仍主要依赖 API 正常分页
 - `number.allmix` / `increase.allmix` 作为兼容别名保留，运行时会归一化到 `mix`
 - `collect` / `collectmix` 当前仅支持当前已登录 Cookie 对应账号
 - `collect` / `collectmix` 必须单独使用，不能和 `post` / `like` / `mix` / `music` 混用
@@ -162,6 +161,10 @@ browser_fallback:
   max_scrolls: 240
   idle_rounds: 8
   wait_timeout_seconds: 600
+
+mix_cache:
+  enabled: true
+  ttl_seconds: 86400
 
 transcript:
   enabled: false
@@ -448,7 +451,10 @@ pytest -q
 | `increase.post/like/mix/music` | 各模式增量开关 |
 | `start_time` / `end_time` | 时间过滤（格式 `YYYY-MM-DD`） |
 | `folderstyle` | 按作品维度创建子目录 |
-| `browser_fallback.*` | `post` 翻页受限时启用浏览器兜底 |
+| `filename_template` / `folder_template` | 文件与作品目录模板；合集支持 `{episode}`（自动补零序号）和 `{episode_title}`（完整“第001集：标题”） |
+| `legacy_layout` | 兼容旧版单合集布局：按发布时间升序编号并保存到 `mix_<合集名>_<合集ID>/` |
+| `mix_cache.*` | 完整合集列表缓存；默认有效 24 小时，命中后不再启动浏览器 |
+| `browser_fallback.*` | 单作品、`post` 翻页或合集 URL 被 Argus 拒绝时启用真实浏览器兜底 |
 | `progress.quiet_logs` | 进度阶段静默日志，减少刷屏 |
 | `transcript.*` | 视频下载后的可选转写 |
 | `proxy` | 为 API 请求和媒体下载设置 HTTP/HTTPS 代理，例如 `http://127.0.0.1:7890` |
@@ -462,6 +468,11 @@ pytest -q
 | `retry_times` | 失败重试次数 |
 
 ## 输出目录
+
+启用 `legacy_layout: true` 并使用 `filename_template: "{episode_title}"` 时，
+单合集会按旧版规则保存为 `Downloaded/mix_<合集名>_<合集ID>/第001集：标题.mp4`。
+少于 100 条时序号为两位，100 条及以上自动扩为三位。完整列表缓存位于
+`Downloaded/.cache/mix/<合集ID>.json`。
 
 默认 `folderstyle: true` 且 `database_path: dy_downloader.db` 时：
 

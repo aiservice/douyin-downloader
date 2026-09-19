@@ -207,8 +207,60 @@ async def test_video_downloader_reports_item_progress(tmp_path, monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_video_downloader_uses_browser_detail_fallback(tmp_path, monkeypatch):
+    downloader, api_client = _build_downloader(tmp_path)
+    downloader.config.update(
+        browser_fallback={
+            "enabled": True,
+            "headless": False,
+            "wait_timeout_seconds": 123,
+        }
+    )
+    reporter = _FakeProgressReporter()
+    downloader.progress_reporter = reporter
+    browser_calls = []
+
+    async def _fake_should_download(self, _aweme_id):
+        return True
+
+    async def _missing_direct_detail(_aweme_id: str):
+        return None
+
+    async def _browser_detail(aweme_id: str, **kwargs):
+        browser_calls.append((aweme_id, kwargs))
+        return {"aweme_id": aweme_id, "author": {"nickname": "browser-author"}}
+
+    async def _fake_download_aweme(self, _aweme_data):
+        return True
+
+    downloader._should_download = _fake_should_download.__get__(downloader, VideoDownloader)
+    downloader._download_aweme = _fake_download_aweme.__get__(downloader, VideoDownloader)
+    monkeypatch.setattr(api_client, "get_video_detail", _missing_direct_detail)
+    monkeypatch.setattr(api_client, "get_video_detail_via_browser", _browser_detail)
+
+    result = await downloader.download({"aweme_id": "7670322988125785387"})
+
+    assert result.success == 1
+    assert result.failed == 0
+    assert browser_calls == [
+        (
+            "7670322988125785387",
+            {
+                "page_type": "video",
+                "headless": False,
+                "wait_timeout_seconds": 123,
+            },
+        )
+    ]
+    assert ("浏览器回补", "直连接口受限，打开作品页面获取详情") in reporter.step_updates
+
+    await api_client.close()
+
+
+@pytest.mark.asyncio
 async def test_detail_failure_records_item_reason(tmp_path, monkeypatch):
     downloader, api_client = _build_downloader(tmp_path)
+    downloader.config.update(browser_fallback={"enabled": False})
 
     async def _fake_should_download(self, _aweme_id):
         return True
@@ -254,7 +306,10 @@ async def test_existing_video_detail_failure_reports_detail_reason(
     """已下载 + 开启评论时仍会取详情；取详情失败的行必须写真实原因，不能沿用跳过原因。"""
     aweme_id = "7552196871758843145"
     downloader, api_client = _build_downloader(tmp_path)
-    downloader.config.update(comments={"enabled": True})
+    downloader.config.update(
+        comments={"enabled": True},
+        browser_fallback={"enabled": False},
+    )
     if via_history:
         downloader.config.update(redownload_missing_files=False)
         downloader.database = _HistoryDatabase(downloaded=True)

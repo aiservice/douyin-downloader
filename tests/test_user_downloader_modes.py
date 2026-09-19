@@ -406,7 +406,7 @@ def test_post_strategy_recovers_when_full_page_stops_with_capped_profile_count(
             "status_code": 0,
         }
 
-    async def _recover(_sec_uid, _user_info, aweme_list):
+    async def _recover(_sec_uid, _user_info, aweme_list, **_kwargs):
         aweme_list.append(_make_aweme("recovered"))
 
     monkeypatch.setattr(downloader.api_client, "get_user_post", _full_page)
@@ -425,7 +425,7 @@ def test_post_strategy_times_out_stalled_page_and_recovers(tmp_path, monkeypatch
     async def _stalled_page(_sec_uid, max_cursor=0, count=20):
         await asyncio.Event().wait()
 
-    async def _recover(_sec_uid, _user_info, aweme_list):
+    async def _recover(_sec_uid, _user_info, aweme_list, **_kwargs):
         aweme_list.append(_make_aweme("recovered"))
 
     monkeypatch.setattr(downloader.api_client, "get_user_post", _stalled_page)
@@ -495,6 +495,7 @@ def test_post_strategy_browser_recovery_counts_filtered_media(tmp_path, monkeypa
     downloader.config._data["media_types"] = ["gallery"]
     downloader.config._data["browser_fallback"]["enabled"] = True
     browser_expected_counts = []
+    browser_filters = []
 
     async def _full_video_page(_sec_uid, max_cursor=0, count=20):
         return {
@@ -508,12 +509,15 @@ def test_post_strategy_browser_recovery_counts_filtered_media(tmp_path, monkeypa
         _sec_uid,
         *,
         expected_count,
+        candidate_filter,
+        start_ts,
         headless,
         max_scrolls,
         idle_rounds,
         wait_timeout_seconds,
     ):
         browser_expected_counts.append(expected_count)
+        browser_filters.append((candidate_filter, start_ts))
         return ["gallery-1", "gallery-2"]
 
     gallery_items = {
@@ -541,5 +545,12 @@ def test_post_strategy_browser_recovery_counts_filtered_media(tmp_path, monkeypa
     items = asyncio.run(strategy.collect_items("sec_uid_x", {"aweme_count": 20}))
     filtered = strategy.apply_filters(items)
 
-    assert browser_expected_counts == [0]
+    assert browser_expected_counts == [2]
+    candidate_filter, start_ts = browser_filters[0]
+    assert start_ts is None
+    assert candidate_filter([_make_aweme("video")]) == []
+    assert [item["aweme_id"] for item in candidate_filter(list(gallery_items.values()))] == [
+        "gallery-1",
+        "gallery-2",
+    ]
     assert [item["aweme_id"] for item in filtered] == ["gallery-1", "gallery-2"]

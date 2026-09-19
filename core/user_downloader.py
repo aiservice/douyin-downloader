@@ -13,6 +13,7 @@ from core.metadata import build_author_home_url
 from core.user_mode_registry import UserModeRegistry
 from core.user_modes.base_strategy import PageRequestFailedError
 from utils.logger import setup_logger
+from utils.naming import episode_number_width
 
 logger = setup_logger("UserDownloader")
 
@@ -445,6 +446,21 @@ class UserDownloader(BaseDownloader):
             seen_aweme_ids.add(aweme_id)
             deduped_items.append(item)
 
+        filename_template = str(self.config.get("filename_template") or "")
+        folder_template = str(self.config.get("folder_template") or "")
+        uses_episode_number = bool(self.config.get("legacy_layout", False)) or any(
+            "{episode" in template for template in (filename_template, folder_template)
+        )
+        if uses_episode_number:
+            deduped_items = sorted(
+                (dict(item) for item in deduped_items),
+                key=lambda item: int(item.get("create_time") or 0),
+            )
+            episode_width = episode_number_width(len(deduped_items))
+            for episode_number, item in enumerate(deduped_items, start=1):
+                item["_episode_number"] = episode_number
+                item["_episode_width"] = episode_width
+
         result = DownloadResult()
         result.total = len(deduped_items)
         self._progress_set_item_total(result.total, "作品待下载")
@@ -533,9 +549,11 @@ class UserDownloader(BaseDownloader):
 
         browser_cfg = self.config.get("browser_fallback", {}) or {}
         number_limit = self.config.get("number", {}).get("post", 0)
-        # 在分页受限场景下，user_info.aweme_count 常常不可靠（经常只返回 20）
-        # 媒体筛选需要先拿到详情才能判断，不能用原始 ID 数提前截断。
-        expected_count = 0 if item_filter else int(number_limit or 0)
+        # 在分页受限场景下，user_info.aweme_count 常常不可靠（经常只返回 20）。
+        # 条数上限必须按置顶 / 时间 / 媒体过滤后的候选项判断，不能按原始 ID
+        # 提前截断；真实页面采集器会用 candidate_filter 统计可下载项。
+        expected_count = int(number_limit or 0)
+        start_ts, _end_ts = self._time_range_bounds()
         if self._post_recovery_limit_reached(aweme_list, number_limit, item_filter):
             logger.info(
                 "Browser fallback skipped: number limit reached existing=%s limit=%s",
@@ -559,6 +577,8 @@ class UserDownloader(BaseDownloader):
             browser_aweme_ids = await self.api_client.collect_user_post_ids_via_browser(
                 sec_uid,
                 expected_count=expected_count,
+                candidate_filter=item_filter,
+                start_ts=start_ts,
                 headless=bool(browser_cfg.get("headless", False)),
                 max_scrolls=int(browser_cfg.get("max_scrolls", 240) or 240),
                 idle_rounds=int(browser_cfg.get("idle_rounds", 8) or 8),

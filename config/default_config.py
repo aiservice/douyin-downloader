@@ -17,6 +17,9 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     # 与历史行为一致（`{date}_{title}_{id}`），用户可在设置中改写。
     "filename_template": "{date}_{title}_{id}",
     "folder_template": "{date}_{title}_{id}",
+    # 兼容原版 douyin-downloader 的单合集布局：按发布时间升序编号，并把
+    # 直接合集保存到 mix_<合集名>_<合集ID>/。默认关闭，避免改变已有用户目录。
+    "legacy_layout": False,
     # 作者目录层命名方式：
     #   "nickname"    - 作者昵称（默认，最直观，但重名会合并、改名会分裂）
     #   "sec_uid"     - 作者 sec_uid（稳定唯一，但不直观）
@@ -96,6 +99,12 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "max_scrolls": 240,
         "idle_rounds": 8,
         "wait_timeout_seconds": 600,
+    },
+    # 只有确认完整的合集列表才会缓存。缓存命中时无需再次请求 API 或启动浏览器。
+    # 媒体 URL 可能过期，因此默认缓存 24 小时；0 表示永不过期。
+    "mix_cache": {
+        "enabled": True,
+        "ttl_seconds": 86400,
     },
     # 下载完成通知（可选）。providers 支持 bark / telegram / webhook。
     "notifications": {

@@ -80,14 +80,15 @@ _Screenshots were captured from the current desktop `main` build. Demonstration 
     `music/detail`, `music/aweme`, `music/list`
 
   The required `x-secsdk-web-signature` can only be produced by the SDK inside a real Douyin web page, which the CLI's
-  direct API requests cannot carry, so single videos / notes, collections, music and likes / favorites **cannot be
-  downloaded** in the CLI. Profile-post (`post`) API paging is rejected as well; with `playwright` installed and
-  `browser_fallback` left on (headed by default), the browser fallback reads the page's own post-list requests and may
-  still work, but it has not been tested against this gate. The Douzy desktop app sends these requests through its
-  built-in login window and is not affected.
+  direct API requests cannot carry. With `playwright` installed and `browser_fallback` left on (headed by default),
+  single videos / notes, profile posts and collection URLs fall back to a real Douyin page and consume the page's own
+  signed API responses or hydrated detail state. Music and likes / favorites still cannot be downloaded through the
+  CLI's direct API path.
+  The Douzy desktop app sends gated requests through its built-in login window and is not affected.
   Endpoints still reachable directly as of 2026-09-14: user profile, following list, comments, live rooms (webcast),
   hot board and search.
-- Browser fallback is fully validated for `post`; `like/mix/music` currently relies on API pagination
+- Browser fallback covers single videos / notes, profile posts (`post`) and direct collection URLs;
+  `like/music/collect/collectmix` still primarily rely on direct API pagination
 - `number.allmix` / `increase.allmix` are retained as compatibility aliases and normalized to `mix`
 - `collect` / `collectmix` currently work for the account represented by the logged-in cookies only
 - `collect` / `collectmix` must be used alone and cannot be combined with `post` / `like` / `mix` / `music`
@@ -173,6 +174,10 @@ browser_fallback:
   max_scrolls: 240
   idle_rounds: 8
   wait_timeout_seconds: 600
+
+mix_cache:
+  enabled: true
+  ttl_seconds: 86400
 
 transcript:
   enabled: false
@@ -467,7 +472,10 @@ pytest -q
 | `increase.post/like/mix/music` | `true`: skip existing primary media on disk; `false`: redownload and overwrite current scope |
 | `start_time` / `end_time` | Time filter (format: `YYYY-MM-DD`) |
 | `folderstyle` | Create per-item subdirectories |
-| `browser_fallback.*` | Browser fallback for `post` when pagination is restricted |
+| `filename_template` / `folder_template` | File/folder templates; collections support `{episode}` (zero-padded index) and `{episode_title}` (`第001集：Title`) |
+| `legacy_layout` | Original direct-collection layout, ordered oldest-first under `mix_<name>_<mix_id>/` |
+| `mix_cache.*` | Complete collection-list cache; defaults to 24 hours and avoids reopening the browser on a hit |
+| `browser_fallback.*` | Real-browser fallback for single works, restricted `post` pagination and collection URLs |
 | `progress.quiet_logs` | Quiet logs during progress stage |
 | `transcript.*` | Optional transcription after video download |
 | `comments.*` | Per-aweme comments collection (opt-in) |
@@ -481,6 +489,11 @@ pytest -q
 | `retry_times` | Retry count on failure |
 
 ## Output Structure
+
+With `legacy_layout: true` and `filename_template: "{episode_title}"`, direct
+collections use `Downloaded/mix_<name>_<mix_id>/第001集：Title.mp4`. The index
+uses two digits below 100 items and grows to three digits at 100 items. Complete
+list caches are stored in `Downloaded/.cache/mix/<mix_id>.json`.
 
 Default with `folderstyle: true` and `database_path: dy_downloader.db`:
 

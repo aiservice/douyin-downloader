@@ -20,6 +20,9 @@ from utils.naming import (
     build_aweme_context,
     build_live_context,
     build_music_context,
+    compact_legacy_label,
+    episode_number_width,
+    format_legacy_episode_title,
     render_template,
     validate_template,
 )
@@ -121,6 +124,43 @@ def test_render_template_preserves_suffix_vars_after_long_title():
     )
     assert len(out) <= 80
     assert out.endswith("_7419999999999999999_0915")
+
+
+def test_episode_template_uses_dynamic_zero_padding():
+    ctx = build_aweme_context(
+        aweme_id="42",
+        title="标题",
+        author_name="作者",
+        author_sec_uid=None,
+        publish_date="2026-09-19",
+        publish_ts=None,
+        media_type="video",
+        mode="mix",
+        episode_number=2,
+        episode_width=3,
+        episode_title="第002集：标题",
+    )
+
+    assert render_template("第{episode}集_{title}", ctx) == "第002集_标题"
+    assert render_template("{episode_title}", ctx) == "第002集：标题"
+
+
+def test_legacy_episode_title_matches_old_downloader_rules():
+    assert format_legacy_episode_title("作品：剧情开场 #影视解说", 1) == "第01集：剧情开场"
+    assert format_legacy_episode_title("第8集：真相", 3) == "第08集：真相"
+    assert (
+        format_legacy_episode_title("普通标题", 2, episode_width=3)
+        == "第002集：普通标题"
+    )
+    assert compact_legacy_label("2026《大宅门》") == "2026大宅门"
+
+
+def test_episode_number_width_grows_with_batch_size():
+    assert episode_number_width(9) == 2
+    assert episode_number_width(99) == 2
+    assert episode_number_width(100) == 3
+    assert episode_number_width(138) == 3
+    assert episode_number_width(1000) == 4
 
 
 def test_default_template_keeps_long_title_ids_unique():

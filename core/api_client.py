@@ -9,8 +9,8 @@ import re
 import sys
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
-from urllib.parse import urlencode
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple
+from urllib.parse import parse_qs, urlencode, urlparse
 
 import aiohttp
 
@@ -1853,11 +1853,278 @@ class DouyinAPIClient:
             logger.warning("Failed to request Electron homepage screenshot: %s", exc)
             return False
 
+    @staticmethod
+    def _find_aweme_detail_in_payload(
+        payload: Any, aweme_id: str
+    ) -> Optional[Dict[str, Any]]:
+        """Find the richest matching aweme object inside an arbitrary JSON payload."""
+        target_id = str(aweme_id)
+        stack: List[Tuple[Any, int]] = [(payload, 0)]
+        seen: Set[int] = set()
+        best: Optional[Dict[str, Any]] = None
+        best_score = -1
+
+        while stack:
+            value, depth = stack.pop()
+            if depth > 18 or not isinstance(value, (dict, list)):
+                continue
+            identity = id(value)
+            if identity in seen:
+                continue
+            seen.add(identity)
+
+            if isinstance(value, dict):
+                candidate_id = value.get("aweme_id") or value.get("group_id")
+                if candidate_id is not None and str(candidate_id) == target_id:
+                    score = sum(
+                        weight
+                        for key, weight in (
+                            ("video", 8),
+                            ("images", 8),
+                            ("image_post_info", 8),
+                            ("author", 4),
+                            ("create_time", 2),
+                            ("desc", 1),
+                        )
+                        if value.get(key) is not None
+                    )
+                    if score > best_score:
+                        best = value
+                        best_score = score
+                priority_keys = (
+                    "aweme_detail",
+                    "aweme",
+                    "aweme_list",
+                    "item_list",
+                    "detail",
+                    "data",
+                )
+                for key in reversed(priority_keys):
+                    if key in value:
+                        stack.append((value[key], depth + 1))
+                for key, child in value.items():
+                    if key not in priority_keys:
+                        stack.append((child, depth + 1))
+            else:
+                for child in reversed(value):
+                    stack.append((child, depth + 1))
+
+        return best
+
+    async def _extract_aweme_detail_from_page(
+        self, page: Any, aweme_id: str
+    ) -> Optional[Dict[str, Any]]:
+        """Read hydrated page state when the detail API response was emitted too early."""
+        script = r"""
+(targetId) => {
+  let best = null;
+  let bestScore = -1;
+  const visited = new WeakSet();
+  const inspect = (value, depth = 0) => {
+    if (!value || depth > 18 || typeof value !== "object") return;
+    if (visited.has(value)) return;
+    visited.add(value);
+    if (Array.isArray(value)) {
+      for (const child of value) inspect(child, depth + 1);
+      return;
+    }
+    const candidateId = value.aweme_id ?? value.group_id;
+    if (candidateId != null && String(candidateId) === String(targetId)) {
+      const score = (value.video ? 8 : 0) +
+        (value.images ? 8 : 0) + (value.image_post_info ? 8 : 0) +
+        (value.author ? 4 : 0) + (value.create_time ? 2 : 0) +
+        (value.desc != null ? 1 : 0);
+      if (score > bestScore) {
+        best = value;
+        bestScore = score;
+      }
+    }
+    for (const child of Object.values(value)) inspect(child, depth + 1);
+  };
+
+  for (const value of [window._ROUTER_DATA, window._SSR_HYDRATED_DATA,
+      window.__NEXT_DATA__, window.RENDER_DATA]) {
+    try { inspect(value); } catch (_) {}
+  }
+  const scripts = document.querySelectorAll(
+    'script#RENDER_DATA, script#__NEXT_DATA__, script[type="application/json"]'
+  );
+  for (const node of scripts) {
+    const raw = node.textContent || "";
+    for (const candidate of [raw, (() => {
+      try { return decodeURIComponent(raw); } catch (_) { return ""; }
+    })()]) {
+      if (!candidate) continue;
+      try { inspect(JSON.parse(candidate)); } catch (_) {}
+    }
+  }
+  return best;
+}
+"""
+        try:
+            detail = await page.evaluate(script, str(aweme_id))
+        except TypeError:
+            # Small test doubles and older Playwright wrappers may only expose
+            # evaluate(script). The production path always accepts the arg.
+            return None
+        except Exception as exc:
+            logger.debug("Extract aweme detail from page failed: %s", exc)
+            return None
+        return detail if isinstance(detail, dict) else None
+
+    async def get_video_detail_via_browser(
+        self,
+        aweme_id: str,
+        *,
+        page_type: str = "video",
+        headless: bool = False,
+        wait_timeout_seconds: int = 600,
+    ) -> Optional[Dict[str, Any]]:
+        """Load a video/note page and reuse detail data produced inside that page.
+
+        Douyin's current Argus gate rejects a direct CLI call to ``aweme/detail``.
+        The real page has the required security runtime, so its own API response or
+        hydrated state remains usable without attempting to reproduce the signature.
+        """
+        try:
+            from playwright.async_api import async_playwright
+        except Exception as exc:
+            logger.warning("Playwright not available, video browser fallback disabled: %s", exc)
+            return None
+
+        browser_started = time.monotonic()
+        target_id = str(aweme_id)
+        page_path = "note" if str(page_type).lower() in {"gallery", "note"} else "video"
+        target_url = f"{self.BASE_URL}/{page_path}/{target_id}"
+        timeout_ms = max(30, int(wait_timeout_seconds)) * 1000
+        captured_detail: Optional[Dict[str, Any]] = None
+
+        async with async_playwright() as playwright:
+            executable_path = str(getattr(playwright.chromium, "executable_path", "") or "")
+            logger.info(
+                "Video browser fallback runtime: executable=%s exists=%s",
+                executable_path or "-",
+                bool(executable_path and os.path.exists(executable_path)),
+            )
+            browser = await playwright.chromium.launch(
+                headless=headless,
+                args=[
+                    "--disable-blink-features=AutomationControlled",
+                    "--disable-dev-shm-usage",
+                    "--no-sandbox",
+                ],
+            )
+            context = await browser.new_context(
+                locale="zh-CN",
+                viewport={"width": 1600, "height": 900},
+            )
+            cookies = self._browser_cookie_payload(include_session=True)
+            if cookies:
+                await context.add_cookies(cookies)
+
+            page = await context.new_page()
+            pending_response_tasks: List[asyncio.Task] = []
+
+            async def _handle_response(response: Any) -> None:
+                nonlocal captured_detail
+                if captured_detail is not None:
+                    return
+                url = str(getattr(response, "url", "") or "")
+                if "/aweme/v1/" not in url:
+                    return
+                try:
+                    data = await response.json()
+                except Exception:
+                    return
+                detail = self._find_aweme_detail_in_payload(data, target_id)
+                if detail is not None:
+                    captured_detail = detail
+
+            def _on_response(response: Any) -> None:
+                pending_response_tasks.append(asyncio.create_task(_handle_response(response)))
+
+            async def _drain_response_tasks() -> None:
+                while pending_response_tasks:
+                    current = list(pending_response_tasks)
+                    pending_response_tasks.clear()
+                    await asyncio.gather(*current, return_exceptions=True)
+
+            page.on("response", _on_response)
+            try:
+                try:
+                    await page.goto(target_url, wait_until="domcontentloaded", timeout=timeout_ms)
+                except Exception as exc:
+                    logger.warning(
+                        "Video browser goto timeout or error, continue with current page state: %s",
+                        exc,
+                    )
+
+                await _drain_response_tasks()
+                blocker = await self._browser_verification_reason(page)
+                if blocker:
+                    if headless:
+                        logger.warning(
+                            "检测到%s且当前为 headless 模式，无法人工验证。"
+                            "请将 browser_fallback.headless 设为 false。",
+                            blocker,
+                        )
+                    else:
+                        logger.warning(
+                            "检测到%s，请在浏览器中手工完成，程序会自动继续获取作品详情。",
+                            blocker,
+                        )
+                        cleared = await self._wait_for_manual_verification(
+                            page, wait_timeout_seconds=wait_timeout_seconds
+                        )
+                        if cleared and not page.is_closed():
+                            try:
+                                await page.goto(
+                                    target_url,
+                                    wait_until="domcontentloaded",
+                                    timeout=timeout_ms,
+                                )
+                            except Exception as exc:
+                                logger.warning("Reload video page after verification failed: %s", exc)
+
+                warmup_seconds = min(30, max(5, int(wait_timeout_seconds)))
+                for _ in range(warmup_seconds):
+                    if page.is_closed() or captured_detail is not None:
+                        break
+                    await _drain_response_tasks()
+                    detail = await self._extract_aweme_detail_from_page(page, target_id)
+                    if detail is not None:
+                        captured_detail = detail
+                        break
+                    await page.wait_for_timeout(1000)
+            finally:
+                await _drain_response_tasks()
+                if captured_detail is None and not page.is_closed():
+                    captured_detail = await self._extract_aweme_detail_from_page(page, target_id)
+                try:
+                    browser_cookies = await context.cookies(self.BASE_URL)
+                    self._sync_browser_cookies(browser_cookies)
+                except Exception as exc:
+                    logger.debug("Sync video browser cookies skipped: %s", exc)
+                await context.close()
+                await browser.close()
+
+        logger.warning(
+            "单作品浏览器兜底完成: duration_ms=%s aweme_id=%s detail=%s",
+            _elapsed_ms(browser_started),
+            target_id,
+            bool(captured_detail),
+        )
+        return captured_detail
+
     async def collect_user_post_ids_via_browser(
         self,
         sec_uid: str,
         *,
         expected_count: int = 0,
+        candidate_filter: Optional[
+            Callable[[List[Dict[str, Any]]], List[Dict[str, Any]]]
+        ] = None,
+        start_ts: Optional[int] = None,
         headless: bool = False,
         max_scrolls: int = 240,
         idle_rounds: int = 8,
@@ -1870,6 +2137,10 @@ class DouyinAPIClient:
             logger.warning("Playwright not available, browser fallback disabled: %s", exc)
             return []
 
+        # Reuse the same conservative two-page confirmation rule as direct API
+        # pagination. A single old pinned/out-of-order item must not stop scrolling.
+        from core.user_modes.post_time_boundary import PostTimeBoundary
+
         target_url = f"{self.BASE_URL}/user/{sec_uid}"
         timeout_ms = max(30, int(wait_timeout_seconds)) * 1000
         ids: List[str] = []
@@ -1878,6 +2149,9 @@ class DouyinAPIClient:
         post_api_seen: set[str] = set()
         post_api_aweme_items: Dict[str, Dict[str, Any]] = {}
         post_api_page_hits = 0
+        page_state_item_ids: Set[str] = set()
+        time_boundary = PostTimeBoundary(start_ts)
+        time_boundary_confirmed = False
         self._browser_post_aweme_items = {}
         self._browser_post_stats = {}
 
@@ -1886,6 +2160,15 @@ class DouyinAPIClient:
                 if aweme_id and aweme_id not in seen:
                     seen.add(aweme_id)
                     ids.append(aweme_id)
+
+        def _candidate_count() -> int:
+            if candidate_filter is None:
+                return len(ids)
+            try:
+                return len(candidate_filter(list(post_api_aweme_items.values())))
+            except Exception as exc:
+                logger.warning("Browser post candidate filter failed: %s", exc)
+                return 0
 
         logger.warning(
             "API翻页受限，启动浏览器兜底采集：target=%s expected_count=%s "
@@ -1914,11 +2197,10 @@ class DouyinAPIClient:
                 ],
             )
             context = await browser.new_context(
-                user_agent=self.headers.get("User-Agent", ""),
                 locale="zh-CN",
                 viewport={"width": 1600, "height": 900},
             )
-            cookies = self._browser_cookie_payload()
+            cookies = self._browser_cookie_payload(include_session=True)
             logger.info(
                 "Browser fallback context ready: cookie_count=%s cookie_names=%s",
                 len(cookies),
@@ -1931,7 +2213,7 @@ class DouyinAPIClient:
             pending_response_tasks: List[asyncio.Task] = []
 
             async def _handle_response(response):
-                nonlocal post_api_page_hits
+                nonlocal post_api_page_hits, time_boundary_confirmed
                 url = response.url or ""
                 if "/aweme/v1/web/aweme/post/" not in url:
                     return
@@ -1958,9 +2240,46 @@ class DouyinAPIClient:
                         if aweme_id not in post_api_seen:
                             post_api_seen.add(aweme_id)
                             post_api_ids.append(aweme_id)
+                    decision = time_boundary.observe_page(
+                        [item for item in aweme_items if isinstance(item, dict)]
+                    )
+                    if decision.should_stop:
+                        time_boundary_confirmed = True
+                    if decision.degraded_reason:
+                        logger.warning(
+                            "Browser post time early-stop disabled: reason=%s",
+                            decision.degraded_reason,
+                        )
 
             def _on_response(response):
                 pending_response_tasks.append(asyncio.create_task(_handle_response(response)))
+
+            async def _drain_response_tasks() -> None:
+                while pending_response_tasks:
+                    current = list(pending_response_tasks)
+                    pending_response_tasks.clear()
+                    await asyncio.gather(*current, return_exceptions=True)
+
+            async def _merge_page_state_items() -> None:
+                page_items = await self._extract_aweme_items_from_page(page)
+                extracted: List[str] = []
+                for item in page_items:
+                    author = item.get("author")
+                    item_sec_uid = (
+                        str(author.get("sec_uid") or "")
+                        if isinstance(author, dict)
+                        else ""
+                    )
+                    if item_sec_uid != str(sec_uid):
+                        continue
+                    aweme_id = str(item.get("aweme_id") or item.get("group_id") or "")
+                    if not aweme_id:
+                        continue
+                    extracted.append(aweme_id)
+                    page_state_item_ids.add(aweme_id)
+                    if aweme_id not in post_api_aweme_items:
+                        post_api_aweme_items[aweme_id] = item
+                _merge(extracted)
 
             page.on("response", _on_response)
 
@@ -1983,14 +2302,16 @@ class DouyinAPIClient:
                     title[:200],
                     safe_log_url(getattr(page, "url", target_url)),
                 )
-                if "验证码" in title:
+                blocker = await self._browser_verification_reason(page)
+                if blocker:
                     if headless:
                         logger.warning(
-                            "检测到验证码页面且当前为 headless 模式，无法人工验证。"
-                            "请将 browser_fallback.headless 设为 false。"
+                            "检测到%s且当前为 headless 模式，无法人工验证。"
+                            "请将 browser_fallback.headless 设为 false。",
+                            blocker,
                         )
                         return []
-                    logger.warning("检测到验证码页面，请在浏览器中完成验证，程序会自动继续采集。")
+                    logger.warning("检测到%s，请在浏览器中手工完成，程序会自动继续采集。", blocker)
                     await self._wait_for_manual_verification(
                         page, wait_timeout_seconds=wait_timeout_seconds
                     )
@@ -2011,7 +2332,9 @@ class DouyinAPIClient:
                             logger.warning("Browser page closed during warmup")
                             break
                         _merge(await self._extract_aweme_ids_from_page(page))
-                        if ids:
+                        await _merge_page_state_items()
+                        await _drain_response_tasks()
+                        if ids or time_boundary_confirmed:
                             break
                         await page.wait_for_timeout(1000)
 
@@ -2023,17 +2346,41 @@ class DouyinAPIClient:
                         if page.is_closed():
                             logger.warning("Browser page closed during scrolling")
                             break
+                        if expected_count > 0 and _candidate_count() >= expected_count:
+                            break
+                        if time_boundary_confirmed:
+                            break
+                        blocker = await self._browser_verification_reason(page)
+                        if blocker:
+                            if headless:
+                                logger.warning(
+                                    "主页滚动时触发%s且当前为 headless 模式，停止采集。",
+                                    blocker,
+                                )
+                                break
+                            logger.warning(
+                                "主页滚动时触发%s，请在浏览器中手工完成，程序会自动继续。",
+                                blocker,
+                            )
+                            if not await self._wait_for_manual_verification(
+                                page, wait_timeout_seconds=wait_timeout_seconds
+                            ):
+                                break
+                        before = len(ids)
                         await page.mouse.wheel(0, 3800)
                         await page.wait_for_timeout(1200)
 
-                        before = len(ids)
                         _merge(await self._extract_aweme_ids_from_page(page))
+                        await _merge_page_state_items()
+                        await _drain_response_tasks()
                         if len(ids) == before:
                             stable_rounds += 1
                         else:
                             stable_rounds = 0
 
-                        if expected_count > 0 and len(ids) >= expected_count:
+                        if expected_count > 0 and _candidate_count() >= expected_count:
+                            break
+                        if time_boundary_confirmed:
                             break
                         if expected_count <= 0 and stable_rounds >= idle_stop_rounds:
                             break
@@ -2043,8 +2390,7 @@ class DouyinAPIClient:
                         exc,
                     )
             finally:
-                if pending_response_tasks:
-                    await asyncio.gather(*pending_response_tasks, return_exceptions=True)
+                await _drain_response_tasks()
                 try:
                     browser_cookies = await context.cookies(self.BASE_URL)
                     self._sync_browser_cookies(browser_cookies)
@@ -2066,6 +2412,9 @@ class DouyinAPIClient:
             "selected_ids": len(selected_ids),
             "post_items": len(post_api_aweme_items),
             "post_pages": post_api_page_hits,
+            "page_state_items": len(page_state_item_ids),
+            "candidate_items": _candidate_count(),
+            "time_boundary_reached": int(time_boundary_confirmed),
         }
         logger.warning(
             "浏览器兜底采集 aweme_id: duration_ms=%s merged=%s from_post_api=%s "
@@ -2079,6 +2428,363 @@ class DouyinAPIClient:
         )
         return selected_ids
 
+    async def collect_mix_aweme_via_browser(
+        self,
+        mix_id: str,
+        *,
+        max_items: int = 0,
+        headless: bool = False,
+        max_scrolls: int = 240,
+        idle_rounds: int = 8,
+        wait_timeout_seconds: int = 600,
+    ) -> Dict[str, Any]:
+        """Collect a mix from responses emitted by a real Douyin page.
+
+        ``mix/aweme`` is rejected by Argus when the CLI calls it directly.  The
+        collection page can still call it because Douyin's in-page SDK adds the
+        per-request security signature.  Listen to those page-owned responses
+        instead of trying to reproduce that signature in Python.
+        """
+        empty_result: Dict[str, Any] = {
+            "items": [],
+            "mix_detail": None,
+            "complete": False,
+            "terminal": False,
+            "limit_reached": False,
+            "pages": 0,
+            "reason": "",
+        }
+        try:
+            from playwright.async_api import async_playwright
+        except Exception as exc:
+            logger.warning("Playwright not available, mix browser fallback disabled: %s", exc)
+            empty_result["reason"] = (
+                "未安装 Playwright；请运行 pip install playwright && "
+                "python -m playwright install chromium"
+            )
+            return empty_result
+
+        browser_started = time.monotonic()
+        mix_id = str(mix_id)
+        target_url = f"{self.BASE_URL}/collection/{mix_id}"
+        timeout_ms = max(30, int(wait_timeout_seconds)) * 1000
+        items_by_id: Dict[str, Dict[str, Any]] = {}
+        mix_detail: Optional[Dict[str, Any]] = None
+        page_hits = 0
+        response_failures = 0
+        saw_terminal_page = False
+        verification_failure_reason = ""
+
+        def _response_targets_mix(url: str, path: str) -> bool:
+            try:
+                parsed = urlparse(url)
+                if path not in parsed.path:
+                    return False
+                query = parse_qs(parsed.query)
+                values = query.get("mix_id") or query.get("series_id") or []
+                return not values or str(values[0]) == mix_id
+            except Exception:
+                return path in url
+
+        async with async_playwright() as playwright:
+            executable_path = str(getattr(playwright.chromium, "executable_path", "") or "")
+            logger.info(
+                "Mix browser fallback runtime: executable=%s exists=%s",
+                executable_path or "-",
+                bool(executable_path and os.path.exists(executable_path)),
+            )
+            browser = await playwright.chromium.launch(
+                headless=headless,
+                args=[
+                    "--disable-blink-features=AutomationControlled",
+                    "--disable-dev-shm-usage",
+                    "--no-sandbox",
+                ],
+            )
+            context = await browser.new_context(
+                locale="zh-CN",
+                viewport={"width": 1600, "height": 900},
+            )
+            # The collection rail hides pagination behind a login overlay when
+            # session cookies are omitted.  This browser is the explicit Argus
+            # fallback for the user's authenticated CLI run, so carry the full
+            # Douyin session into this isolated context.
+            cookies = self._browser_cookie_payload(include_session=True)
+            if cookies:
+                await context.add_cookies(cookies)
+
+            page = await context.new_page()
+            pending_response_tasks: List[asyncio.Task] = []
+
+            async def _handle_response(response) -> None:
+                nonlocal mix_detail, page_hits, response_failures, saw_terminal_page
+                url = str(getattr(response, "url", "") or "")
+                is_aweme_page = _response_targets_mix(
+                    url, "/aweme/v1/web/mix/aweme/"
+                ) or _response_targets_mix(url, "/aweme/v1/web/series/aweme/")
+                is_mix_detail = _response_targets_mix(url, "/aweme/v1/web/mix/detail/")
+                if not is_aweme_page and not is_mix_detail:
+                    return
+                try:
+                    data = await response.json()
+                except Exception:
+                    response_failures += 1
+                    return
+                if not isinstance(data, dict) or int(data.get("status_code") or 0) != 0:
+                    response_failures += 1
+                    return
+
+                if is_mix_detail:
+                    detail = data.get("mix_info") or data.get("mix_detail") or data.get("data")
+                    if isinstance(detail, dict):
+                        mix_detail = detail
+
+                if not is_aweme_page:
+                    return
+                aweme_items = data.get("aweme_list")
+                if not isinstance(aweme_items, list):
+                    response_failures += 1
+                    return
+                page_hits += 1
+                before_count = len(items_by_id)
+                for item in aweme_items:
+                    if not isinstance(item, dict):
+                        continue
+                    aweme_id = str(item.get("aweme_id") or "")
+                    if aweme_id and aweme_id not in items_by_id:
+                        items_by_id[aweme_id] = item
+                    if mix_detail is None:
+                        detail = item.get("mix_info") or item.get("series_info")
+                        if isinstance(detail, dict):
+                            mix_detail = dict(detail)
+                            if not mix_detail.get("mix_id"):
+                                mix_detail["mix_id"] = str(
+                                    mix_detail.get("series_id") or mix_id
+                                )
+                            if not mix_detail.get("mix_name"):
+                                mix_detail["mix_name"] = mix_detail.get("series_name") or ""
+                            if not mix_detail.get("author") and isinstance(
+                                item.get("author"), dict
+                            ):
+                                mix_detail["author"] = item.get("author")
+                if "has_more" in data and not bool(data.get("has_more")):
+                    saw_terminal_page = True
+                logger.debug(
+                    "Mix browser page response: path=%s cursor=%s items=%s added=%s "
+                    "has_more=%s total=%s",
+                    urlparse(url).path,
+                    data.get("max_cursor") or data.get("cursor") or 0,
+                    len(aweme_items),
+                    len(items_by_id) - before_count,
+                    data.get("has_more"),
+                    len(items_by_id),
+                )
+
+            def _on_response(response) -> None:
+                pending_response_tasks.append(asyncio.create_task(_handle_response(response)))
+
+            async def _drain_response_tasks() -> None:
+                while pending_response_tasks:
+                    current = list(pending_response_tasks)
+                    pending_response_tasks.clear()
+                    await asyncio.gather(*current, return_exceptions=True)
+
+            async def _click_load_more() -> bool:
+                getter = getattr(page, "get_by_role", None)
+                if not callable(getter):
+                    return False
+                try:
+                    locator = getter("button", name="点击加载更多", exact=True)
+                    if await locator.count() <= 0:
+                        return False
+                    button = locator.first
+                    if not await button.is_visible():
+                        return False
+                    # Logged-out/public pages may put a transparent login panel over
+                    # the collection rail.  The button itself remains enabled and its
+                    # handler works; force the intended click through that overlay.
+                    await button.click(timeout=5_000, force=True)
+                    return True
+                except Exception as exc:
+                    logger.debug("Click mix load-more button skipped: %s", exc)
+                    return False
+
+            async def _wait_for_browser_verification() -> bool:
+                nonlocal verification_failure_reason
+                if await self._dismiss_browser_interstitials(page):
+                    await page.wait_for_timeout(500)
+                    await _drain_response_tasks()
+                blocker = await self._browser_verification_reason(page)
+                if not blocker:
+                    return True
+                if headless:
+                    verification_failure_reason = (
+                        f"浏览器触发{blocker}；请将 browser_fallback.headless 设为 false"
+                    )
+                    return False
+                logger.warning(
+                    "检测到%s，请在浏览器窗口中手工完成；最长等待 %s 秒。",
+                    blocker,
+                    wait_timeout_seconds,
+                )
+                cleared = await self._wait_for_manual_verification(
+                    page, wait_timeout_seconds=wait_timeout_seconds
+                )
+                if not cleared:
+                    verification_failure_reason = f"等待手工完成{blocker}超时"
+                    return False
+                await page.wait_for_timeout(1000)
+                await _drain_response_tasks()
+                return True
+
+            async def _wait_for_page_progress(
+                before_count: int,
+                *,
+                timeout_seconds: int,
+                retry_load_more: bool,
+            ) -> bool:
+                """Wait for the next signed page, keeping manual verification alive."""
+                deadline = asyncio.get_running_loop().time() + max(1, timeout_seconds)
+                next_retry = asyncio.get_running_loop().time() + 5
+                while asyncio.get_running_loop().time() < deadline:
+                    if page.is_closed():
+                        return False
+                    await page.wait_for_timeout(500)
+                    await _drain_response_tasks()
+                    if len(items_by_id) > before_count or saw_terminal_page:
+                        return True
+                    if not await _wait_for_browser_verification():
+                        return False
+                    now = asyncio.get_running_loop().time()
+                    if retry_load_more and now >= next_retry:
+                        await _click_load_more()
+                        next_retry = now + 5
+                return False
+
+            page.on("response", _on_response)
+
+            try:
+                try:
+                    await page.goto(target_url, wait_until="domcontentloaded", timeout=timeout_ms)
+                except Exception as exc:
+                    logger.warning(
+                        "Mix browser goto timeout or error, continue with current page state: %s",
+                        exc,
+                    )
+
+                title = ""
+                try:
+                    title = await page.title()
+                except Exception:
+                    pass
+                logger.info(
+                    "Mix browser page state: title=%r url=%s",
+                    title[:200],
+                    safe_log_url(getattr(page, "url", target_url)),
+                )
+                if not await _wait_for_browser_verification():
+                    empty_result["reason"] = verification_failure_reason
+                    return empty_result
+
+                warmup_seconds = min(20, max(3, int(wait_timeout_seconds)))
+                for _ in range(warmup_seconds):
+                    if page.is_closed():
+                        break
+                    await page.wait_for_timeout(1000)
+                    await _drain_response_tasks()
+                    if not await _wait_for_browser_verification():
+                        break
+                    if saw_terminal_page or (max_items > 0 and len(items_by_id) >= max_items):
+                        break
+                    if items_by_id:
+                        break
+
+                stable_rounds = 0
+                max_scroll_rounds = max(1, int(max_scrolls))
+                idle_stop_rounds = max(1, int(idle_rounds))
+                for _ in range(max_scroll_rounds):
+                    if page.is_closed():
+                        break
+                    if not await _wait_for_browser_verification():
+                        break
+                    if saw_terminal_page or (max_items > 0 and len(items_by_id) >= max_items):
+                        break
+                    before = len(items_by_id)
+                    failures_before = response_failures
+                    clicked = await _click_load_more()
+                    if not clicked:
+                        await page.mouse.wheel(0, 3800)
+                    progressed = await _wait_for_page_progress(
+                        before,
+                        timeout_seconds=8,
+                        retry_load_more=False,
+                    )
+                    if (
+                        not progressed
+                        and not headless
+                        and response_failures > failures_before
+                    ):
+                        logger.warning(
+                            "合集下一页触发了验证或异常响应；浏览器将保持打开，"
+                            "请手工完成验证，最长等待 %s 秒。",
+                            wait_timeout_seconds,
+                        )
+                        progressed = await _wait_for_page_progress(
+                            before,
+                            timeout_seconds=wait_timeout_seconds,
+                            retry_load_more=True,
+                        )
+                    if progressed:
+                        stable_rounds = 0
+                    else:
+                        stable_rounds += 1
+                    if stable_rounds >= idle_stop_rounds:
+                        break
+            finally:
+                await _drain_response_tasks()
+                try:
+                    browser_cookies = await context.cookies(self.BASE_URL)
+                    self._sync_browser_cookies(browser_cookies)
+                except Exception as exc:
+                    logger.debug("Sync mix browser cookies skipped: %s", exc)
+                await context.close()
+                await browser.close()
+
+        items = list(items_by_id.values())
+        limit_reached = max_items > 0 and len(items) >= max_items
+        if limit_reached:
+            items = items[:max_items]
+        complete = saw_terminal_page or limit_reached
+        reason = ""
+        if not complete:
+            if verification_failure_reason:
+                reason = verification_failure_reason
+            elif response_failures:
+                reason = "网页接口响应异常，未确认合集已取完"
+            elif items:
+                reason = "页面滚动停止，未确认合集已取完"
+            else:
+                reason = "网页未发出可用的 mix/aweme 或 series/aweme 响应"
+        logger.warning(
+            "合集浏览器兜底完成: duration_ms=%s mix_id=%s items=%s pages=%s "
+            "complete=%s response_failures=%s",
+            _elapsed_ms(browser_started),
+            mix_id,
+            len(items),
+            page_hits,
+            complete,
+            response_failures,
+        )
+        return {
+            "items": items,
+            "mix_detail": mix_detail,
+            "complete": complete,
+            "terminal": saw_terminal_page,
+            "limit_reached": limit_reached,
+            "pages": page_hits,
+            "reason": reason,
+        }
+
     def pop_browser_post_aweme_items(self) -> Dict[str, Dict[str, Any]]:
         items = self._browser_post_aweme_items
         self._browser_post_aweme_items = {}
@@ -2089,12 +2795,12 @@ class DouyinAPIClient:
         self._browser_post_stats = {}
         return stats
 
-    def _browser_cookie_payload(self) -> List[Dict[str, str]]:
+    def _browser_cookie_payload(self, *, include_session: bool = False) -> List[Dict[str, str]]:
         payload: List[Dict[str, str]] = []
         for name, value in self.cookies.items():
             if not name:
                 continue
-            if name in self._BROWSER_COOKIE_BLOCKLIST:
+            if not include_session and name in self._BROWSER_COOKIE_BLOCKLIST:
                 continue
             payload.append(
                 {
@@ -2146,23 +2852,156 @@ class DouyinAPIClient:
             logger.debug("Extract aweme_id from page failed: %s", exc)
         return []
 
-    async def _wait_for_manual_verification(self, page, *, wait_timeout_seconds: int) -> None:
+    async def _extract_aweme_items_from_page(self, page: Any) -> List[Dict[str, Any]]:
+        """Collect full aweme objects embedded in a profile page's hydrated state."""
+        script = r"""
+() => {
+  const best = new Map();
+  const scores = new Map();
+  const visited = new WeakSet();
+  const inspect = (value, depth = 0) => {
+    if (!value || depth > 18 || typeof value !== "object") return;
+    if (visited.has(value)) return;
+    visited.add(value);
+    if (Array.isArray(value)) {
+      for (const child of value) inspect(child, depth + 1);
+      return;
+    }
+    const candidateId = value.aweme_id ?? value.group_id;
+    if (/^\d{15,20}$/.test(String(candidateId || ""))) {
+      const score = (value.video ? 8 : 0) +
+        (value.images ? 8 : 0) + (value.image_post_info ? 8 : 0) +
+        (value.author ? 4 : 0) + (value.create_time ? 2 : 0) +
+        (value.desc != null ? 1 : 0);
+      const key = String(candidateId);
+      if (score > (scores.get(key) ?? -1)) {
+        best.set(key, value);
+        scores.set(key, score);
+      }
+    }
+    for (const child of Object.values(value)) inspect(child, depth + 1);
+  };
+
+  for (const value of [window._ROUTER_DATA, window._SSR_HYDRATED_DATA,
+      window.__NEXT_DATA__, window.RENDER_DATA]) {
+    try { inspect(value); } catch (_) {}
+  }
+  const scripts = document.querySelectorAll(
+    'script#RENDER_DATA, script#__NEXT_DATA__, script[type="application/json"]'
+  );
+  for (const node of scripts) {
+    const raw = node.textContent || "";
+    for (const candidate of [raw, (() => {
+      try { return decodeURIComponent(raw); } catch (_) { return ""; }
+    })()]) {
+      if (!candidate) continue;
+      try { inspect(JSON.parse(candidate)); } catch (_) {}
+    }
+  }
+  return Array.from(best.values());
+}
+"""
+        try:
+            items = await page.evaluate(script)
+        except Exception as exc:
+            logger.debug("Extract aweme items from page failed: %s", exc)
+            return []
+        if not isinstance(items, list):
+            return []
+        return [item for item in items if isinstance(item, dict)]
+
+    async def _browser_verification_reason(self, page) -> str:
+        title = ""
+        try:
+            title = str(await page.title() or "")
+        except Exception:
+            pass
+        for marker in ("验证码", "安全验证", "验证后继续"):
+            if marker in title:
+                return marker
+
+        script = r"""
+() => {
+  const visible = (element) => {
+    if (!element) return false;
+    const style = window.getComputedStyle(element);
+    const rect = element.getBoundingClientRect();
+    return style.display !== "none" && style.visibility !== "hidden" &&
+      style.opacity !== "0" && rect.width > 0 && rect.height > 0;
+  };
+  const markers = ["验证码", "安全验证", "验证后继续", "完成验证",
+    "拖动滑块", "请依次点击", "请按顺序点击"];
+  const bodyText = document.body?.innerText || "";
+  for (const marker of markers) {
+    if (bodyText.includes(marker)) return marker;
+  }
+  const panels = Array.from(document.querySelectorAll(
+    '[id^="login-full-panel-"], [class*="captcha" i], [class*="verify" i], ' +
+    'iframe[src*="captcha" i], iframe[src*="verify" i]'
+  )).filter(visible);
+  for (const panel of panels) {
+    const text = panel.innerText || panel.getAttribute("title") || "";
+    const marker = markers.find((value) => text.includes(value));
+    if (marker) return marker;
+    if (panel.id?.startsWith("login-full-panel-") ||
+        /扫码登录|手机号登录|密码登录|登录后/.test(text)) {
+      return "登录/验证窗口";
+    }
+  }
+  return "";
+}
+"""
+        try:
+            return str(await page.evaluate(script) or "")
+        except Exception as exc:
+            logger.debug("Inspect browser verification state failed: %s", exc)
+            return ""
+
+    async def _dismiss_browser_interstitials(self, page) -> bool:
+        """Dismiss non-security prompts that cover the collection controls.
+
+        Douyin may ask whether to save the imported login after the page opens.
+        Choosing ``取消`` changes no account data and is necessary before the
+        collection's load-more button can receive clicks.  Captchas and safety
+        checks are deliberately not handled here; those wait for the user.
+        """
+        getter = getattr(page, "get_by_text", None)
+        if not callable(getter):
+            return False
+        try:
+            prompt = getter("是否保存登录信息", exact=False)
+            if await prompt.count() <= 0 or not await prompt.first.is_visible():
+                return False
+            cancel = getter("取消", exact=True)
+            if await cancel.count() <= 0:
+                return False
+            await cancel.first.click(timeout=5_000, force=True)
+            logger.info("Dismissed Douyin save-login interstitial")
+            return True
+        except Exception as exc:
+            logger.debug("Dismiss browser interstitial skipped: %s", exc)
+            return False
+
+    async def _wait_for_manual_verification(
+        self, page, *, wait_timeout_seconds: int
+    ) -> bool:
         deadline = asyncio.get_running_loop().time() + max(30, int(wait_timeout_seconds))
+        last_reason = ""
         while asyncio.get_running_loop().time() < deadline:
             if page.is_closed():
                 logger.warning("Browser page closed while waiting manual verification")
-                return
-            title = ""
-            try:
-                title = await page.title()
-            except Exception:
-                pass
-            if "验证码" not in title:
-                logger.warning("验证码页面已退出，继续采集。")
-                return
+                return False
+            reason = await self._browser_verification_reason(page)
+            if not reason:
+                logger.warning("验证窗口已退出，继续采集。")
+                return True
+            if reason != last_reason:
+                logger.warning("正在等待手工完成%s…", reason)
+                last_reason = reason
             await page.wait_for_timeout(1000)
 
-        logger.warning("等待手动验证超时（%ss），继续按当前页面状态采集。", wait_timeout_seconds)
+        logger.warning("等待手动验证超时（%ss）。", wait_timeout_seconds)
+        return False
 
     def _sync_browser_cookies(self, browser_cookies: List[Dict[str, Any]]) -> None:
         merged: Dict[str, str] = {}

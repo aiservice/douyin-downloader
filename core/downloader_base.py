@@ -27,6 +27,7 @@ from utils.naming import (
     DEFAULT_FILE_TEMPLATE,
     DEFAULT_FOLDER_TEMPLATE,
     build_aweme_context,
+    format_legacy_episode_title,
     render_template,
 )
 from utils.paid_content import (
@@ -517,6 +518,15 @@ class BaseDownloader(ABC):
         mode: Optional[str],
         author_sec_uid: Optional[str] = None,
     ) -> Dict[str, str]:
+        episode_number = aweme_data.get("_episode_number")
+        episode_width = int(aweme_data.get("_episode_width") or 2)
+        episode_title = ""
+        if episode_number is not None:
+            episode_title = format_legacy_episode_title(
+                str(metadata["desc"]),
+                int(episode_number),
+                episode_width=episode_width,
+            )
         template_context = build_aweme_context(
             aweme_id=str(metadata["aweme_id"]),
             title=str(metadata["desc"]),
@@ -526,6 +536,9 @@ class BaseDownloader(ABC):
             publish_ts=metadata["publish_ts"],
             media_type=str(metadata["media_type"]),
             mode=mode,
+            episode_number=episode_number,
+            episode_width=episode_width,
+            episode_title=episode_title,
         )
         fallback = f"{metadata['publish_date']}_{metadata['aweme_id']}"
         return {
@@ -549,6 +562,7 @@ class BaseDownloader(ABC):
         *,
         author_sec_uid: Optional[str] = None,
         collection_dir: Optional[str] = None,
+        output_root: Optional[str] = None,
     ) -> Optional[Dict[str, Any]]:
         metadata = self._aweme_file_metadata(aweme_data)
         if metadata is None:
@@ -563,7 +577,8 @@ class BaseDownloader(ABC):
             author_sec_uid=effective_sec_uid,
         )
         author_dir_style = self.config.get("author_dir") or "nickname"
-        self._report_author_output_dir(author_name, effective_sec_uid, author_dir_style)
+        if not output_root:
+            self._report_author_output_dir(author_name, effective_sec_uid, author_dir_style)
         save_dir = self.file_manager.get_save_path(
             author_name=author_name,
             mode=mode,
@@ -576,6 +591,7 @@ class BaseDownloader(ABC):
             author_dir_style=author_dir_style,
             group_by_mode=self.config.get("group_by_mode", True),
             collection_dir=collection_dir,
+            output_root=output_root,
         )
         return {**metadata, "file_stem": names["file_stem"], "save_dir": save_dir}
 
@@ -605,6 +621,7 @@ class BaseDownloader(ABC):
         *,
         author_sec_uid: Optional[str] = None,
         collection_dir: Optional[str] = None,
+        output_root: Optional[str] = None,
     ) -> bool:
         comments_cfg = self._comments_config()
         if comments_cfg is None:
@@ -616,6 +633,7 @@ class BaseDownloader(ABC):
             mode,
             author_sec_uid=author_sec_uid,
             collection_dir=collection_dir,
+            output_root=output_root,
         )
         if file_context is None:
             return False
@@ -638,6 +656,7 @@ class BaseDownloader(ABC):
         db_batch: Optional[List[Dict[str, Any]]] = None,
         author_sec_uid: Optional[str] = None,
         collection_dir: Optional[str] = None,
+        output_root: Optional[str] = None,
     ) -> bool:
         # retry_executor 直接调本方法（不经过 _should_download），先在
         # 线程里把索引建好，避免成功后的 _mark_local_aweme_downloaded
@@ -649,6 +668,7 @@ class BaseDownloader(ABC):
             mode,
             author_sec_uid=author_sec_uid,
             collection_dir=collection_dir,
+            output_root=output_root,
         )
         if file_context is None:
             return False

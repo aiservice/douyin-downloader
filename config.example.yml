@@ -18,10 +18,13 @@ folderstyle: true
 
 # 文件/目录命名模板。可用变量：
 #   {id} {title} {author} {author_id} {date} {year} {month} {day}
-#   {time} {timestamp} {type} {mode}
-# 要求模板中至少包含 {id} 以避免重名覆盖。
+#   {time} {timestamp} {type} {mode} {episode} {episode_title}
+# {episode} 会按合集总数自动补零；{episode_title} 为旧版的“第001集：标题”。
 filename_template: "{date}_{title}_{id}"
 folder_template: "{date}_{title}_{id}"
+
+# 兼容旧版单合集目录与排序：mix_<合集名>_<合集ID>/，按发布时间从早到晚编号。
+legacy_layout: false
 
 # 作者目录层命名方式。可选值：
 #   nickname     - 仅作者昵称（默认，最直观，但重名会合并、改名会分裂）
@@ -99,11 +102,18 @@ transcript:
   api_key: ""
 
 browser_fallback:
+  # 单作品详情、主页 post 列表或合集接口被 Argus 拒绝时，改由真实网页获取。
+  # 主页的 start_time / end_time 会在浏览器滚动阶段参与候选计数与提前停止。
   enabled: true
   headless: false
   max_scrolls: 240
   idle_rounds: 8
   wait_timeout_seconds: 600
+
+# 完整合集列表缓存。命中后不会再次打开浏览器；0 表示永不过期。
+mix_cache:
+  enabled: true
+  ttl_seconds: 86400
 
 # 评论采集（可选）：启用后每个作品会额外生成 *_comments.json
 comments:

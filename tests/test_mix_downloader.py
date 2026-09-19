@@ -6,7 +6,11 @@ from auth import CookieManager
 from config import ConfigLoader
 from control import QueueManager, RateLimiter, RetryHandler
 from core import item_reasons
-from core.mix_downloader import MixDownloader, derive_mix_collection_dir
+from core.mix_downloader import (
+    MixDownloader,
+    derive_legacy_mix_output_root,
+    derive_mix_collection_dir,
+)
 from storage import FileManager
 
 
@@ -19,6 +23,12 @@ def test_derive_mix_collection_dir():
     assert derive_mix_collection_dir({"mix_name": ""}, 456) == "456"
     assert derive_mix_collection_dir({}, "123") == "123"
     assert derive_mix_collection_dir(None, "123") == "123"
+
+
+def test_derive_legacy_mix_output_root():
+    detail = {"mix_name": "2026《大宅门》"}
+    assert derive_legacy_mix_output_root(detail, "123") == "mix_2026大宅门_123"
+    assert derive_legacy_mix_output_root(None, "123") == "mix_123"
 
 
 class _FakeAPIClient:
@@ -146,6 +156,130 @@ async def test_mix_downloader_collection_dir_falls_back_to_mix_id(tmp_path, monk
     await downloader.download({"mix_id": "123"})
 
     assert captured["collection_dir"] == "123"
+
+
+@pytest.mark.asyncio
+async def test_mix_legacy_layout_sorts_and_assigns_stable_episode_numbers(
+    tmp_path, monkeypatch
+):
+    older = {
+        "aweme_id": "7600224486650121001",
+        "desc": "开场 #大宅门",
+        "create_time": 100,
+        "author": {"nickname": "作者"},
+        "video": {"play_addr": {"url_list": ["https://example.com/1.mp4"]}},
+    }
+    newer = {
+        "aweme_id": "7600224486650121002",
+        "desc": "结尾 #大宅门",
+        "create_time": 200,
+        "author": {"nickname": "作者"},
+        "video": {"play_addr": {"url_list": ["https://example.com/2.mp4"]}},
+    }
+
+    class _LegacyAPI(_FakeAPIClient):
+        async def get_mix_aweme(self, _mix_id, cursor=0, count=20):
+            return {
+                "items": [newer, older],
+                "has_more": False,
+                "max_cursor": cursor,
+                "status_code": 0,
+            }
+
+        async def get_mix_detail(self, _mix_id):
+            return {"mix_name": "2026《大宅门》", "author": {"nickname": "作者"}}
+
+    downloader = _make_mix_downloader(tmp_path, _LegacyAPI())
+    downloader.config.update(
+        legacy_layout=True,
+        filename_template="{episode_title}",
+        folder_template="{episode_title}",
+        mix_cache={"enabled": False},
+    )
+    captured = []
+
+    async def _capture(item, _author, **kwargs):
+        names = downloader._render_aweme_file_names(
+            item,
+            downloader._aweme_file_metadata(item),
+            "作者",
+            "mix",
+        )
+        captured.append((item["aweme_id"], item["_episode_number"], names, kwargs))
+        return True
+
+    async def _always_true(*_args, **_kwargs):
+        return True
+
+    monkeypatch.setattr(downloader, "_should_download", _always_true)
+    monkeypatch.setattr(downloader, "_download_aweme_assets", _capture)
+
+    result = await downloader.download({"mix_id": "123"})
+
+    assert result.success == 2
+    assert [entry[0] for entry in captured] == [older["aweme_id"], newer["aweme_id"]]
+    assert [entry[1] for entry in captured] == [1, 2]
+    assert [entry[2]["file_stem"] for entry in captured] == ["第01集：开场", "第02集：结尾"]
+    assert all(entry[3]["output_root"] == "mix_2026大宅门_123" for entry in captured)
+    assert all(entry[3]["collection_dir"] is None for entry in captured)
+
+
+@pytest.mark.asyncio
+async def test_mix_cache_round_trip_and_limit(tmp_path):
+    downloader = _make_mix_downloader(tmp_path, _FakeAPIClient())
+    downloader.config.update(mix_cache={"enabled": True, "ttl_seconds": 3600})
+    items = [
+        {"aweme_id": "1", "desc": "one"},
+        {"aweme_id": "2", "desc": "two"},
+        {"aweme_id": "3", "desc": "three"},
+    ]
+    detail = {"mix_name": "缓存合集"}
+
+    await downloader._save_mix_cache("123", items, detail)
+    downloader.config.update(number={"mix": 2})
+    cached = await downloader._load_mix_cache("123")
+
+    assert [item["aweme_id"] for item in cached["items"]] == ["1", "2"]
+    assert cached["mix_detail"] == detail
+    assert downloader._mix_cache_path("123").is_file()
+
+
+@pytest.mark.asyncio
+async def test_mix_download_cache_hit_skips_api_and_browser(tmp_path, monkeypatch):
+    seed = _make_mix_downloader(tmp_path, _FakeAPIClient())
+    seed.config.update(mix_cache={"enabled": True, "ttl_seconds": 3600})
+    items = [
+        {
+            "aweme_id": "7600224486650121001",
+            "desc": "cached",
+            "create_time": 100,
+        }
+    ]
+    detail = {"mix_name": "缓存合集", "author": {"nickname": "作者"}}
+    await seed._save_mix_cache("123", items, detail)
+
+    class _MustNotFetch:
+        calls = 0
+
+        async def get_mix_aweme(self, *_args, **_kwargs):
+            self.calls += 1
+            raise AssertionError("cache hit must not fetch the collection again")
+
+    api = _MustNotFetch()
+    downloader = _make_mix_downloader(tmp_path, api)
+    downloader.config.update(mix_cache={"enabled": True, "ttl_seconds": 3600})
+
+    async def _always_true(*_args, **_kwargs):
+        return True
+
+    monkeypatch.setattr(downloader, "_should_download", _always_true)
+    monkeypatch.setattr(downloader, "_download_aweme_assets", _always_true)
+
+    result = await downloader.download({"mix_id": "123"})
+
+    assert result.success == 1
+    assert api.calls == 0
+    assert downloader._mix_cache_hit is True
 
 
 @pytest.mark.asyncio
@@ -356,6 +490,95 @@ async def test_mix_downloader_argus_403_via_bridge_fails_loudly(tmp_path, monkey
         assert [c["path"] for c in bridge.calls] == ["/aweme/v1/web/mix/aweme/"]
     finally:
         await client.close()
+
+
+async def test_mix_downloader_direct_argus_rejection_uses_browser_fallback(
+    tmp_path, monkeypatch
+):
+    from core.api_client import FailedPayload
+
+    class _BrowserFallbackAPI(_ScriptedMixAPIClient):
+        page_bridge = None
+
+        def __init__(self):
+            super().__init__(
+                {
+                    0: _page(
+                        [],
+                        raw=FailedPayload(
+                            FailedPayload.REJECTED,
+                            status=403,
+                            detail="Blocked by ArgusSecurityPlugin Uifid Not Found",
+                        ),
+                    )
+                }
+            )
+            self.browser_calls = []
+            self.detail_calls = 0
+
+        async def collect_mix_aweme_via_browser(self, mix_id, **kwargs):
+            self.browser_calls.append((mix_id, kwargs))
+            return {
+                "items": [_ITEM],
+                "mix_detail": {
+                    "mix_name": "浏览器合集",
+                    "author": {"nickname": "browser-author"},
+                },
+                "complete": True,
+                "pages": 1,
+                "reason": "",
+            }
+
+        async def get_mix_detail(self, _mix_id):
+            self.detail_calls += 1
+            raise AssertionError("browser detail must be reused")
+
+    api = _BrowserFallbackAPI()
+    downloader = _make_mix_downloader(tmp_path, api)
+    _stub_downloads(downloader, monkeypatch)
+
+    result = await downloader.download({"mix_id": "123"})
+
+    assert result.total == 1
+    assert result.success == 1
+    assert result.incomplete_reason is None
+    assert api.detail_calls == 0
+    assert api.browser_calls[0][0] == "123"
+    assert api.browser_calls[0][1]["headless"] is False
+
+
+async def test_mix_downloader_disabled_browser_fallback_preserves_argus_error(
+    tmp_path, monkeypatch
+):
+    from core.api_client import FailedPayload
+    from core.user_modes.base_strategy import PageRequestFailedError
+
+    class _DisabledBrowserAPI(_ScriptedMixAPIClient):
+        page_bridge = None
+
+        def __init__(self):
+            super().__init__(
+                {
+                    0: _page(
+                        [],
+                        raw=FailedPayload(FailedPayload.REJECTED, status=403),
+                    )
+                }
+            )
+            self.browser_called = False
+
+        async def collect_mix_aweme_via_browser(self, _mix_id, **_kwargs):
+            self.browser_called = True
+            return {}
+
+    api = _DisabledBrowserAPI()
+    downloader = _make_mix_downloader(tmp_path, api)
+    downloader.config.update(browser_fallback={"enabled": False})
+    _stub_downloads(downloader, monkeypatch)
+
+    with pytest.raises(PageRequestFailedError, match="合集 第 1 页被抖音拒绝"):
+        await downloader.download({"mix_id": "123"})
+    assert api.browser_called is False
 
 
 async def test_mix_downloader_null_list_via_real_normalizer_is_soft_stop(tmp_path, monkeypatch):

@@ -287,7 +287,9 @@ def test_post_strategy_calls_browser_recover_when_pagination_restricted():
             self._filter_by_time = lambda items: items
             self._limit_count = lambda items, _mode: items
 
-        async def _recover_user_post_with_browser(self, sec_uid, user_info, aweme_list):
+        async def _recover_user_post_with_browser(
+            self, sec_uid, user_info, aweme_list, **_kwargs
+        ):
             self.recovered_called = True
             aweme_list.append(_make_aweme("222"))
 
@@ -330,7 +332,9 @@ def test_post_strategy_calls_browser_recover_when_cursor_stalls():
             self._filter_by_time = lambda items: items
             self._limit_count = lambda items, _mode: items
 
-        async def _recover_user_post_with_browser(self, sec_uid, user_info, aweme_list):
+        async def _recover_user_post_with_browser(
+            self, sec_uid, user_info, aweme_list, **_kwargs
+        ):
             self.recovered_called = True
             aweme_list.append(_make_aweme("444"))
 

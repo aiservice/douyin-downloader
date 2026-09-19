@@ -170,6 +170,7 @@ class FileManager:
         author_dir_style: str = "nickname",
         group_by_mode: bool = True,
         collection_dir: Optional[str] = None,
+        output_root: Optional[str] = None,
     ) -> Path:
         """Compute (and create) the destination directory for a download.
 
@@ -195,23 +196,31 @@ class FileManager:
         and the per-aweme leaf, so each 合集 (mix) lands in its own folder
         (``base/<author>/mix/<collection>/<leaf>``). It is sanitized here;
         empty / whitespace-only values insert nothing (legacy layout).
+
+        ``output_root`` selects a named directory immediately below ``base``
+        and bypasses the author/mode/collection layers. This reproduces the
+        original CLI's direct-collection layout
+        (``base/mix_<name>_<id>/<leaf>``).
         """
-        author_dir = self.get_author_dir(
-            author_name,
-            author_sec_uid=author_sec_uid,
-            author_dir_style=author_dir_style,
-        )
-
-        if mode and group_by_mode:
-            save_dir = author_dir / mode
+        if output_root and str(output_root).strip():
+            save_dir = self.base_path / sanitize_filename(str(output_root).strip())
         else:
-            save_dir = author_dir
+            author_dir = self.get_author_dir(
+                author_name,
+                author_sec_uid=author_sec_uid,
+                author_dir_style=author_dir_style,
+            )
 
-        # Only insert a collection layer for a genuinely non-empty name;
-        # a blank/whitespace value must reproduce the legacy layout rather
-        # than sanitize into an ``untitled`` folder.
-        if collection_dir and str(collection_dir).strip():
-            save_dir = save_dir / sanitize_filename(str(collection_dir).strip())
+            if mode and group_by_mode:
+                save_dir = author_dir / mode
+            else:
+                save_dir = author_dir
+
+            # Only insert a collection layer for a genuinely non-empty name;
+            # a blank/whitespace value must reproduce the legacy layout rather
+            # than sanitize into an ``untitled`` folder.
+            if collection_dir and str(collection_dir).strip():
+                save_dir = save_dir / sanitize_filename(str(collection_dir).strip())
 
         if folderstyle:
             leaf = folder_name

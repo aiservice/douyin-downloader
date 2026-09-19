@@ -29,6 +29,19 @@ ALLOWED_VARIABLES = (
     "timestamp",
     "type",
     "mode",
+    "episode",
+    "episode_title",
+)
+
+_LEGACY_TITLE_PREFIXES = (
+    "视频",
+    "作品",
+    "分享",
+    "发布了",
+    "更新了",
+    "上传了",
+    "分享了一个视频：",
+    "分享了一个视频",
 )
 
 # 默认模板：与历史行为保持一致（`{date}_{title}_{id}`）。作者已经在上级目录，
@@ -169,6 +182,58 @@ def render_template(
     return cleaned
 
 
+def format_legacy_episode_title(
+    title: str, episode_number: int, *, episode_width: int = 2
+) -> str:
+    """Reproduce the old downloader's ``第01集：标题`` naming rule.
+
+    A title that already starts with an episode number keeps that number.
+    Otherwise the stable list position supplied by the caller is used.  The
+    old downloader also dropped hashtag text and capped the final stem at 50
+    characters; keeping those details makes new downloads line up with an
+    existing legacy library.
+    """
+    text = str(title or "").split("#", 1)[0].strip()
+    for prefix in _LEGACY_TITLE_PREFIXES:
+        if text.startswith(prefix):
+            text = text[len(prefix) :].strip()
+            break
+    text = re.sub(r"^[：:、。\.\s]+", "", text)
+
+    explicit = re.match(r"^第\s*(\d+)\s*[集话期](.*)$", text)
+    if explicit:
+        number = int(explicit.group(1))
+        body = re.sub(r"^[：:、。\.\s]+", "", explicit.group(2).strip())
+    else:
+        leading = re.match(r"^(\d+)[、\.。：:\s]+(.+)$", text)
+        if leading:
+            number = int(leading.group(1))
+            body = leading.group(2).strip()
+        else:
+            embedded = re.search(r"第(\d+)[集话期]", text)
+            number = int(embedded.group(1)) if embedded else max(1, int(episode_number))
+            body = re.sub(r"第\d+[集话期]", "", text).strip() if embedded else text
+
+    width = max(2, int(episode_width or 2))
+    stem = f"第{number:0{width}d}集"
+    if body:
+        stem = f"{stem}：{body}"
+    elif not text:
+        stem = f"{stem}：无标题"
+    return sanitize_filename(stem, max_length=50)
+
+
+def compact_legacy_label(value: str, *, max_length: int = 20) -> str:
+    """Apply the old directory-label filter (Chinese/alnum only)."""
+    parts = re.findall(r"[0-9A-Za-z\u4e00-\u9fa5]+", str(value or ""))
+    return "".join(parts).strip()[:max_length]
+
+
+def episode_number_width(total_items: int) -> int:
+    """Return the zero-padding width for a numbered batch."""
+    return max(2, len(str(max(0, int(total_items or 0)))))
+
+
 def _split_date(date_str: str) -> Dict[str, str]:
     """把 ``YYYY-MM-DD`` 拆成 ``{year, month, day}`` 三个字符串。"""
     if not date_str:
@@ -204,6 +269,9 @@ def build_aweme_context(
     publish_ts: Optional[int],
     media_type: str,
     mode: Optional[str] = None,
+    episode_number: Optional[int] = None,
+    episode_width: int = 2,
+    episode_title: str = "",
 ) -> Dict[str, str]:
     """为普通视频/图集下载构造模板上下文。"""
     ctx: Dict[str, str] = {
@@ -219,6 +287,12 @@ def build_aweme_context(
         "timestamp": str(publish_ts) if publish_ts else "",
         "type": media_type or "",
         "mode": mode or "",
+        "episode": (
+            f"{int(episode_number):0{max(2, int(episode_width or 2))}d}"
+            if episode_number is not None
+            else ""
+        ),
+        "episode_title": episode_title or title or "no_title",
     }
     ctx.update(_split_date(publish_date))
     # HHMM 对普通作品无意义，但仍基于 publish_ts 填一份，避免模板使用 {time}
@@ -254,6 +328,8 @@ def build_music_context(
         "timestamp": "",
         "type": "music",
         "mode": mode,
+        "episode": "",
+        "episode_title": title or "no_title",
     }
     ctx.update(_split_date(publish_date))
     return ctx
@@ -289,6 +365,8 @@ def build_live_context(
         "timestamp": str(int(started_at.timestamp())),
         "type": "live",
         "mode": mode,
+        "episode": "",
+        "episode_title": title or "no_title",
     }
     # 仍按自然日拆分 year/month/day，保证模板 {year}/{month}/{day} 语义一致。
     ctx.update(_split_date(iso_date))

@@ -107,16 +107,26 @@ class PostUserModeStrategy(BaseUserModeStrategy):
         before = len(aweme_list)
         if self._browser_recovery_available():
             self.downloader._progress_update_step("拉取作品列表", "分页受限，尝试浏览器回补")
-        if self._media_type_filter_enabled():
-            await self.downloader._recover_user_post_with_browser(
-                sec_uid,
-                user_info,
-                aweme_list,
-                item_filter=self._filter_by_media_type,
-            )
-        else:
-            await self.downloader._recover_user_post_with_browser(sec_uid, user_info, aweme_list)
+        await self.downloader._recover_user_post_with_browser(
+            sec_uid,
+            user_info,
+            aweme_list,
+            item_filter=self._filter_browser_candidates,
+        )
         return len(aweme_list) > before
+
+    def _filter_browser_candidates(
+        self, items: List[Dict[str, Any]]
+    ) -> List[Dict[str, Any]]:
+        """Mirror final post filters while the browser decides whether to stop.
+
+        This is especially important for an ``end_time`` window: the newest grid
+        entries may all be outside the requested range, so counting raw IDs would
+        stop before the browser ever reaches a qualifying work.
+        """
+        filtered = self._filter_pinned_items(items)
+        filtered = self.downloader._filter_by_time(filtered)
+        return self._filter_by_media_type(filtered)
 
     def _browser_recovery_available(self) -> bool:
         checker = getattr(self.downloader, "_browser_recovery_unavailable_reason", None)
