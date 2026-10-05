@@ -8,6 +8,7 @@ from tools.download_single_for_api import (
     _get_video_detail_for_api,
     _primary_video_path,
     _should_download_for_api,
+    _single_video_title,
     extract_first_url,
 )
 
@@ -33,6 +34,16 @@ def test_primary_video_path_uses_rendered_context(tmp_path):
     context = {"save_dir": tmp_path / "author", "file_stem": "视频标题"}
 
     assert _primary_video_path(context) == Path(tmp_path / "author" / "视频标题.mp4")
+
+
+def test_single_video_title_removes_hashtag_suffix():
+    desc = "有外国网友好奇中国人接受了什么教育？   #硬核深度计划 #中国 #权谋"
+
+    assert _single_video_title(desc, "123") == "有外国网友好奇中国人接受了什么教育？"
+
+
+def test_single_video_title_falls_back_to_aweme_id():
+    assert _single_video_title("#只有标签", "123") == "123"
 
 
 async def test_browser_fallback_error_is_preserved_for_java_log():

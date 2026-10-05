@@ -47,6 +47,12 @@ def _primary_video_path(file_context: Dict[str, Any]) -> Path:
     return Path(file_context["save_dir"]) / f"{file_context['file_stem']}.mp4"
 
 
+def _single_video_title(value: Any, aweme_id: str) -> str:
+    """Use the human title for an API download, excluding trailing hashtags."""
+    title = str(value or "").split("#", 1)[0].strip()
+    return title or str(aweme_id)
+
+
 def _resolve_database_path(config: ConfigLoader) -> Path:
     database_path = Path(config.get("database_path", "dy_downloader.db") or "dy_downloader.db")
     if database_path.is_absolute():
@@ -204,6 +210,12 @@ async def download_single(
             await rate_limiter.acquire()
             aweme_id = str(parsed["aweme_id"])
             aweme_data = await _get_video_detail_for_api(downloader, aweme_id, config)
+            # A copied Douyin description commonly appends many hashtags.  They
+            # are useful metadata but make poor source filenames for the Java
+            # watermark workflow, so this one-shot API entry uses only the
+            # human-readable title before the first hashtag.
+            aweme_data = dict(aweme_data)
+            aweme_data["desc"] = _single_video_title(aweme_data.get("desc"), aweme_id)
 
             author = aweme_data.get("author", {}) or {}
             author_name = author.get("nickname", "unknown")

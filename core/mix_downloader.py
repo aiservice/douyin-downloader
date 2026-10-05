@@ -273,16 +273,16 @@ class MixDownloader(BaseDownloader):
                 wait_timeout_seconds=int(browser_cfg.get("wait_timeout_seconds", 600) or 600),
             )
         except Exception as exc:
-            logger.warning("合集浏览器兜底失败，保留原始 Argus 错误：%s", exc)
+            logger.warning("合集浏览器兜底失败：%s", exc)
             self._progress_update_step("浏览器采集合集", f"启动失败：{exc}")
-            return None
+            raise PageRequestFailedError(f"合集浏览器采集失败：{exc}") from exc
 
         if not isinstance(payload, dict):
             logger.warning("合集浏览器兜底返回了无效结果：%s", type(payload).__name__)
-            return None
+            raise PageRequestFailedError("合集浏览器采集失败：返回了无效结果")
         raw_items = payload.get("items")
         if not isinstance(raw_items, list):
-            return None
+            raise PageRequestFailedError("合集浏览器采集失败：未返回作品列表")
 
         items: List[Dict[str, Any]] = []
         seen_ids = set()
@@ -302,7 +302,7 @@ class MixDownloader(BaseDownloader):
             reason = str(payload.get("reason") or "没有捕获到合集接口响应")
             logger.warning("合集浏览器兜底未成功：%s", reason)
             self._progress_update_step("浏览器采集合集", f"未成功：{reason}")
-            return None
+            raise PageRequestFailedError(f"合集浏览器采集失败：{reason}")
 
         detail = payload.get("mix_detail")
         if isinstance(detail, dict):

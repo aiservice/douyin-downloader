@@ -2428,6 +2428,34 @@ class DouyinAPIClient:
         )
         return selected_ids
 
+    @staticmethod
+    def _redirected_video_mix_detail(
+        page_url: str, payload: Any
+    ) -> Optional[Dict[str, Any]]:
+        """Identify the mix of the video actually opened by a collection redirect.
+
+        Some collection URLs resolve to a video whose mix ID differs from the
+        requested URL. Only trust detail for that displayed video, never a
+        recommendation or an unrelated mix response on the same page.
+        """
+        parsed = urlparse(str(page_url))
+        host = (parsed.hostname or "").lower()
+        if host != "douyin.com" and not host.endswith(".douyin.com"):
+            return None
+        match = re.fullmatch(r"/video/(\d+)/?", parsed.path)
+        if not match:
+            return None
+        aweme = DouyinAPIClient._find_aweme_detail_in_payload(payload, match.group(1))
+        if not isinstance(aweme, dict):
+            return None
+        detail = aweme.get("mix_info")
+        if not isinstance(detail, dict) or not detail.get("mix_id"):
+            return None
+        detail = dict(detail)
+        if not detail.get("author") and isinstance(aweme.get("author"), dict):
+            detail["author"] = aweme["author"]
+        return detail
+
     async def collect_mix_aweme_via_browser(
         self,
         mix_id: str,
@@ -2474,6 +2502,11 @@ class DouyinAPIClient:
         response_failures = 0
         saw_terminal_page = False
         verification_failure_reason = ""
+        accepted_mix_ids = {mix_id}
+        redirected_mix_resolved = False
+        # Mix pagination can finish before the displayed video's detail. Keep
+        # a bounded set until the redirect establishes the canonical mix ID.
+        buffered_mix_responses: List[Tuple[str, Dict[str, Any]]] = []
 
         def _response_targets_mix(url: str, path: str) -> bool:
             try:
@@ -2482,7 +2515,7 @@ class DouyinAPIClient:
                     return False
                 query = parse_qs(parsed.query)
                 values = query.get("mix_id") or query.get("series_id") or []
-                return not values or str(values[0]) == mix_id
+                return not values or str(values[0]) in accepted_mix_ids
             except Exception:
                 return path in url
 
@@ -2516,23 +2549,17 @@ class DouyinAPIClient:
             page = await context.new_page()
             pending_response_tasks: List[asyncio.Task] = []
 
-            async def _handle_response(response) -> None:
+            def _capture_mix_response(url: str, data: Dict[str, Any]) -> bool:
                 nonlocal mix_detail, page_hits, response_failures, saw_terminal_page
-                url = str(getattr(response, "url", "") or "")
                 is_aweme_page = _response_targets_mix(
                     url, "/aweme/v1/web/mix/aweme/"
                 ) or _response_targets_mix(url, "/aweme/v1/web/series/aweme/")
                 is_mix_detail = _response_targets_mix(url, "/aweme/v1/web/mix/detail/")
                 if not is_aweme_page and not is_mix_detail:
-                    return
-                try:
-                    data = await response.json()
-                except Exception:
+                    return False
+                if int(data.get("status_code") or 0) != 0:
                     response_failures += 1
-                    return
-                if not isinstance(data, dict) or int(data.get("status_code") or 0) != 0:
-                    response_failures += 1
-                    return
+                    return True
 
                 if is_mix_detail:
                     detail = data.get("mix_info") or data.get("mix_detail") or data.get("data")
@@ -2540,11 +2567,11 @@ class DouyinAPIClient:
                         mix_detail = detail
 
                 if not is_aweme_page:
-                    return
+                    return True
                 aweme_items = data.get("aweme_list")
                 if not isinstance(aweme_items, list):
                     response_failures += 1
-                    return
+                    return True
                 page_hits += 1
                 before_count = len(items_by_id)
                 for item in aweme_items:
@@ -2579,6 +2606,55 @@ class DouyinAPIClient:
                     data.get("has_more"),
                     len(items_by_id),
                 )
+                return True
+
+            async def _handle_response(response) -> None:
+                nonlocal mix_detail, redirected_mix_resolved, response_failures
+                url = str(getattr(response, "url", "") or "")
+                path = urlparse(url).path
+                is_video_detail = path == "/aweme/v1/web/aweme/detail/"
+                if not is_video_detail and path not in {
+                    "/aweme/v1/web/mix/aweme/",
+                    "/aweme/v1/web/series/aweme/",
+                    "/aweme/v1/web/mix/detail/",
+                }:
+                    return
+                try:
+                    data = await response.json()
+                except Exception:
+                    if not is_video_detail and _response_targets_mix(url, path):
+                        response_failures += 1
+                    return
+                if not isinstance(data, dict):
+                    if not is_video_detail and _response_targets_mix(url, path):
+                        response_failures += 1
+                    return
+                if is_video_detail:
+                    if redirected_mix_resolved or int(data.get("status_code") or 0) != 0:
+                        return
+                    detail = self._redirected_video_mix_detail(
+                        str(getattr(page, "url", "") or ""), data
+                    )
+                    if detail is None:
+                        return
+                    resolved_id = str(detail["mix_id"])
+                    accepted_mix_ids.add(resolved_id)
+                    redirected_mix_resolved = True
+                    mix_detail = detail
+                    if resolved_id != mix_id:
+                        logger.warning(
+                            "合集页面跳转后确认实际合集：requested_mix_id=%s "
+                            "resolved_mix_id=%s mix_name=%s",
+                            mix_id, resolved_id, detail.get("mix_name") or "",
+                        )
+                    for buffered_url, buffered_data in buffered_mix_responses:
+                        _capture_mix_response(buffered_url, buffered_data)
+                    buffered_mix_responses.clear()
+                    return
+                if not _capture_mix_response(url, data) and not redirected_mix_resolved:
+                    buffered_mix_responses.append((url, data))
+                    if len(buffered_mix_responses) > 20:
+                        buffered_mix_responses.pop(0)
 
             def _on_response(response) -> None:
                 pending_response_tasks.append(asyncio.create_task(_handle_response(response)))

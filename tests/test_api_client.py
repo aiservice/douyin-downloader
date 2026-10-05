@@ -534,9 +534,13 @@ def test_post_browser_limit_uses_filtered_candidates(monkeypatch):
     assert stats["candidate_items"] == 1
 
 
-def test_mix_browser_fallback_collects_page_owned_responses(monkeypatch):
+@pytest.mark.parametrize("redirected,detail_last", [(False, False), (True, False), (True, True)])
+def test_mix_browser_fallback_collects_page_owned_responses(
+    monkeypatch, redirected, detail_last
+):
     item_1 = {"aweme_id": "7600224486650121888", "desc": "one"}
     item_2 = {"aweme_id": "7600224486650121889", "desc": "two"}
+    actual_mix_id = "456" if redirected else "123"
     captured_cookies = []
 
     class _FakeResponse:
@@ -563,12 +567,47 @@ def test_mix_browser_fallback_collects_page_owned_responses(monkeypatch):
 
         async def goto(self, *_args, **_kwargs):
             base = "https://www.douyin.com/aweme/v1/web"
+            if redirected:
+                self.url = f"https://www.douyin.com/video/{item_1['aweme_id']}"
+            # Recommendations must not supply items, metadata or a terminal page.
             self._response_handler(
                 _FakeResponse(
-                    f"{base}/mix/detail/?mix_id=123",
+                    f"{base}/aweme/detail/?aweme_id=999",
+                    {
+                        "status_code": 0,
+                        "aweme_detail": {
+                            "aweme_id": "999",
+                            "mix_info": {"mix_id": "999", "mix_name": "无关合集"},
+                        },
+                    },
+                )
+            )
+            self._response_handler(
+                _FakeResponse(
+                    f"{base}/mix/aweme/?mix_id=999&cursor=0",
+                    {"status_code": 0, "aweme_list": [{"aweme_id": "999"}], "has_more": 0},
+                )
+            )
+            video_detail = _FakeResponse(
+                f"{base}/aweme/detail/?aweme_id={item_1['aweme_id']}",
+                {
+                    "status_code": 0,
+                    "aweme_detail": {
+                        **item_1,
+                        "mix_info": {"mix_id": actual_mix_id, "mix_name": "浏览器合集"},
+                        "author": {"nickname": "author"},
+                    },
+                },
+            )
+            if redirected and not detail_last:
+                self._response_handler(video_detail)
+            self._response_handler(
+                _FakeResponse(
+                    f"{base}/mix/detail/?mix_id={actual_mix_id}",
                     {
                         "status_code": 0,
                         "mix_info": {
+                            "mix_id": actual_mix_id,
                             "mix_name": "浏览器合集",
                             "author": {"nickname": "author"},
                         },
@@ -577,13 +616,13 @@ def test_mix_browser_fallback_collects_page_owned_responses(monkeypatch):
             )
             self._response_handler(
                 _FakeResponse(
-                    f"{base}/series/aweme/?series_id=123&cursor=0",
+                    f"{base}/series/aweme/?series_id={actual_mix_id}&cursor=0",
                     {"status_code": 0, "aweme_list": [item_1], "has_more": 1},
                 )
             )
             self._response_handler(
                 _FakeResponse(
-                    f"{base}/series/aweme/?series_id=123&cursor=1",
+                    f"{base}/series/aweme/?series_id={actual_mix_id}&cursor=1",
                     {
                         "status_code": 0,
                         "aweme_list": [item_1, item_2],
@@ -591,6 +630,8 @@ def test_mix_browser_fallback_collects_page_owned_responses(monkeypatch):
                     },
                 )
             )
+            if redirected and detail_last:
+                self._response_handler(video_detail)
 
         async def title(self):
             return "浏览器合集 - 抖音"
@@ -669,10 +710,47 @@ def test_mix_browser_fallback_collects_page_owned_responses(monkeypatch):
         "7600224486650121889",
     ]
     assert result["mix_detail"]["mix_name"] == "浏览器合集"
+    assert result["mix_detail"]["mix_id"] == actual_mix_id
     assert result["complete"] is True
     assert result["pages"] == 2
     assert "user_agent" not in browser.context_kwargs
     assert any(cookie["name"] == "sessionid_ss" for cookie in captured_cookies)
+
+
+@pytest.mark.parametrize(
+    "page_url",
+    [
+        "https://www.douyin.com/collection/123",
+        "https://www.douyin.com/video/999",
+        "https://example.com/video/111",
+        "https://fake-douyin.com/video/111",
+    ],
+)
+def test_redirected_video_mix_detail_requires_the_displayed_douyin_video(page_url):
+    payload = {
+        "aweme_detail": {
+            "aweme_id": "111",
+            "mix_info": {"mix_id": "456", "mix_name": "合集"},
+        }
+    }
+    assert DouyinAPIClient._redirected_video_mix_detail(page_url, payload) is None
+
+
+def test_redirected_video_mix_detail_preserves_mix_and_author():
+    payload = {
+        "aweme_detail": {
+            "aweme_id": "111",
+            "mix_info": {"mix_id": "456", "mix_name": "合集"},
+            "author": {"nickname": "author"},
+        }
+    }
+    detail = DouyinAPIClient._redirected_video_mix_detail(
+        "https://www.douyin.com/video/111?from=collection", payload
+    )
+    assert detail == {
+        "mix_id": "456", "mix_name": "合集", "author": {"nickname": "author"}
+    }
+    assert "author" not in payload["aweme_detail"]["mix_info"]
 
 
 def test_mix_browser_fallback_dismisses_save_login_prompt():

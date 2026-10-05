@@ -547,6 +547,42 @@ async def test_mix_downloader_direct_argus_rejection_uses_browser_fallback(
     assert api.browser_calls[0][1]["headless"] is False
 
 
+@pytest.mark.parametrize("failure", ["exception", "empty", "invalid", "missing_list"])
+async def test_mix_downloader_browser_failure_preserves_actual_reason(
+    tmp_path, monkeypatch, failure
+):
+    from core.api_client import FailedPayload
+    from core.user_modes.base_strategy import PageRequestFailedError
+
+    class _FailedBrowserAPI(_ScriptedMixAPIClient):
+        page_bridge = None
+
+        async def collect_mix_aweme_via_browser(self, _mix_id, **_kwargs):
+            if failure == "exception":
+                raise RuntimeError("浏览器启动失败")
+            if failure == "invalid":
+                return None
+            if failure == "missing_list":
+                return {}
+            return {"items": [], "complete": False, "reason": "网页未发出可用的合集响应"}
+
+    expected_reasons = {
+        "exception": "浏览器启动失败",
+        "empty": "网页未发出可用的合集响应",
+        "invalid": "返回了无效结果",
+        "missing_list": "未返回作品列表",
+    }
+    api = _FailedBrowserAPI(
+        {0: _page([], raw=FailedPayload(FailedPayload.REJECTED, status=403))}
+    )
+    downloader = _make_mix_downloader(tmp_path, api)
+    _stub_downloads(downloader, monkeypatch)
+
+    with pytest.raises(PageRequestFailedError, match=expected_reasons[failure]) as info:
+        await downloader.download({"mix_id": "123"})
+    assert "当前运行方式不支持" not in str(info.value)
+
+
 async def test_mix_downloader_disabled_browser_fallback_preserves_argus_error(
     tmp_path, monkeypatch
 ):
