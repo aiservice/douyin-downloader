@@ -2260,6 +2260,11 @@ class DouyinAPIClient:
                     pending_response_tasks.clear()
                     await asyncio.gather(*current, return_exceptions=True)
 
+            async def _dismiss_user_interstitials() -> None:
+                if await self._dismiss_browser_interstitials(page):
+                    await page.wait_for_timeout(500)
+                    await _drain_response_tasks()
+
             async def _merge_page_state_items() -> None:
                 page_items = await self._extract_aweme_items_from_page(page)
                 extracted: List[str] = []
@@ -2302,6 +2307,7 @@ class DouyinAPIClient:
                     title[:200],
                     safe_log_url(getattr(page, "url", target_url)),
                 )
+                await _dismiss_user_interstitials()
                 blocker = await self._browser_verification_reason(page)
                 if blocker:
                     if headless:
@@ -2312,9 +2318,10 @@ class DouyinAPIClient:
                         )
                         return []
                     logger.warning("检测到%s，请在浏览器中手工完成，程序会自动继续采集。", blocker)
-                    await self._wait_for_manual_verification(
+                    if not await self._wait_for_manual_verification(
                         page, wait_timeout_seconds=wait_timeout_seconds
-                    )
+                    ):
+                        return []
                     if not page.is_closed():
                         try:
                             await page.goto(
@@ -2331,6 +2338,7 @@ class DouyinAPIClient:
                         if page.is_closed():
                             logger.warning("Browser page closed during warmup")
                             break
+                        await _dismiss_user_interstitials()
                         _merge(await self._extract_aweme_ids_from_page(page))
                         await _merge_page_state_items()
                         await _drain_response_tasks()
@@ -2346,6 +2354,7 @@ class DouyinAPIClient:
                         if page.is_closed():
                             logger.warning("Browser page closed during scrolling")
                             break
+                        await _dismiss_user_interstitials()
                         if expected_count > 0 and _candidate_count() >= expected_count:
                             break
                         if time_boundary_confirmed:
@@ -2366,9 +2375,11 @@ class DouyinAPIClient:
                                 page, wait_timeout_seconds=wait_timeout_seconds
                             ):
                                 break
+                            await _dismiss_user_interstitials()
                         before = len(ids)
-                        await page.mouse.wheel(0, 3800)
+                        await self._scroll_user_post_page(page)
                         await page.wait_for_timeout(1200)
+                        await _dismiss_user_interstitials()
 
                         _merge(await self._extract_aweme_ids_from_page(page))
                         await _merge_page_state_items()
@@ -2507,6 +2518,7 @@ class DouyinAPIClient:
         # Mix pagination can finish before the displayed video's detail. Keep
         # a bounded set until the redirect establishes the canonical mix ID.
         buffered_mix_responses: List[Tuple[str, Dict[str, Any]]] = []
+        page_order_ids: List[str] = []
 
         def _response_targets_mix(url: str, path: str) -> bool:
             try:
@@ -2818,6 +2830,10 @@ class DouyinAPIClient:
                         break
             finally:
                 await _drain_response_tasks()
+                if items_by_id and not page.is_closed():
+                    page_order_ids = await self._extract_mix_aweme_ids_from_page(
+                        page, mix_name=str((mix_detail or {}).get("mix_name") or "")
+                    )
                 try:
                     browser_cookies = await context.cookies(self.BASE_URL)
                     self._sync_browser_cookies(browser_cookies)
@@ -2826,7 +2842,20 @@ class DouyinAPIClient:
                 await context.close()
                 await browser.close()
 
-        items = list(items_by_id.values())
+        ordered_ids = [aweme_id for aweme_id in page_order_ids if aweme_id in items_by_id]
+        ordered_set = set(ordered_ids)
+        # A virtualized rail may only show its last few entries. Reorder those
+        # entries in their existing slots, never move that visible tail first.
+        page_id_iterator = iter(ordered_ids)
+        items = [
+            items_by_id[next(page_id_iterator)] if aweme_id in ordered_set else item
+            for aweme_id, item in items_by_id.items()
+        ]
+        if items and len(ordered_set) < len(items):
+            logger.warning(
+                "合集 DOM 顺序匹配 %s/%s 条，未显示的作品保留网页接口列表顺序",
+                len(ordered_set), len(items),
+            )
         limit_reached = max_items > 0 and len(items) >= max_items
         if limit_reached:
             items = items[:max_items]
@@ -2882,10 +2911,44 @@ class DouyinAPIClient:
                 {
                     "name": str(name),
                     "value": str(value or ""),
-                    "url": f"{self.BASE_URL}/",
+                    # Pagination switches to sibling hosts such as www-hj.douyin.com.
+                    # URL-scoped cookies would drop login/security state on those hosts.
+                    "domain": ".douyin.com",
+                    "path": "/",
                 }
             )
         return payload
+
+    async def _extract_mix_aweme_ids_from_page(
+        self, page, *, mix_name: str = ""
+    ) -> List[str]:
+        """Read the collection rail, not recommendations or hydrated JSON order."""
+        script = r"""
+(mixName) => {
+  const result = [];
+  const seen = new Set();
+  for (const image of document.querySelectorAll('li img[alt]')) {
+    const alt = image.getAttribute('alt') || '';
+    if (!/^合集\s*[·•]/.test(alt)) continue;
+    if (mixName && !alt.includes(mixName)) continue;
+    const item = image.closest('li');
+    for (const link of item.querySelectorAll('a[href]')) {
+      const match = (link.getAttribute('href') || '').match(/\/video\/(\d{15,20})/);
+      if (!match || seen.has(match[1])) continue;
+      seen.add(match[1]);
+      result.push(match[1]);
+    }
+  }
+  return result;
+}
+"""
+        try:
+            data = await page.evaluate(script, mix_name)
+            if isinstance(data, list):
+                return list(dict.fromkeys(str(value) for value in data if value))
+        except Exception as exc:
+            logger.debug("Extract collection DOM order failed: %s", exc)
+        return []
 
     async def _extract_aweme_ids_from_page(self, page) -> List[str]:
         script = """
@@ -2986,6 +3049,59 @@ class DouyinAPIClient:
             return []
         return [item for item in items if isinstance(item, dict)]
 
+    async def _scroll_user_post_page(self, page) -> None:
+        """Scroll the works container, not the navigation under the default pointer."""
+        script = r"""
+() => {
+  const scrollable = (element) => {
+    const style = getComputedStyle(element);
+    const rect = element.getBoundingClientRect();
+    return /(auto|scroll)/.test(style.overflowY) &&
+      element.scrollHeight > element.clientHeight + 1 &&
+      style.display !== "none" && style.visibility !== "hidden" && style.opacity !== "0" &&
+      rect.width > 0 && rect.height > 0 && rect.bottom > 0 && rect.right > 0 &&
+      rect.top < innerHeight && rect.left < innerWidth;
+  };
+  let container = Array.from(document.querySelectorAll(".route-scroll-container"))
+    .find(scrollable);
+  if (!container) {
+    const ancestors = new Set();
+    for (const link of document.querySelectorAll('a[href*="/video/"], a[href*="/note/"]')) {
+      for (let parent = link.parentElement; parent; parent = parent.parentElement) {
+        if (scrollable(parent)) ancestors.add(parent);
+      }
+    }
+    container = Array.from(ancestors).sort((left, right) => {
+      const a = left.getBoundingClientRect();
+      const b = right.getBoundingClientRect();
+      return b.width * b.height - a.width * a.height;
+    })[0];
+  }
+  container = container || document.scrollingElement || document.documentElement;
+  const isDocument = container === document.scrollingElement;
+  const rect = isDocument
+    ? {left: 0, top: 0, right: innerWidth, bottom: innerHeight}
+    : container.getBoundingClientRect();
+  container.scrollTop = container.scrollHeight;
+  return {
+    x: (Math.max(0, rect.left) + Math.min(innerWidth, rect.right)) / 2,
+    y: (Math.max(0, rect.top) + Math.min(innerHeight, rect.bottom)) / 2,
+  };
+}
+"""
+        # The browser fallback creates a 1600x900 viewport. Keep a useful pointer
+        # target even while navigation temporarily makes DOM inspection fail.
+        x, y = 850, 550
+        try:
+            position = await page.evaluate(script)
+            if isinstance(position, dict):
+                x = float(position.get("x", x))
+                y = float(position.get("y", y))
+        except Exception as exc:
+            logger.debug("Inspect user works scroll container failed: %s", exc)
+        await page.mouse.move(x, y)
+        await page.mouse.wheel(0, 3800)
+
     async def _browser_verification_reason(self, page) -> str:
         title = ""
         try:
@@ -3034,12 +3150,12 @@ class DouyinAPIClient:
             return ""
 
     async def _dismiss_browser_interstitials(self, page) -> bool:
-        """Dismiss non-security prompts that cover the collection controls.
+        """Dismiss non-security prompts that cover the page controls.
 
         Douyin may ask whether to save the imported login after the page opens.
         Choosing ``取消`` changes no account data and is necessary before the
-        collection's load-more button can receive clicks.  Captchas and safety
-        checks are deliberately not handled here; those wait for the user.
+        works grid or collection's load-more button can receive input. Captchas
+        and safety checks are deliberately not handled here; those wait for the user.
         """
         getter = getattr(page, "get_by_text", None)
         if not callable(getter):

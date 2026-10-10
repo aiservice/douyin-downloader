@@ -17,9 +17,11 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     # 与历史行为一致（`{date}_{title}_{id}`），用户可在设置中改写。
     "filename_template": "{date}_{title}_{id}",
     "folder_template": "{date}_{title}_{id}",
-    # 兼容原版 douyin-downloader 的单合集布局：按发布时间升序编号，并把
+    # 兼容原版 douyin-downloader 的单合集布局；排序由 mix_order 独立控制。
     # 直接合集保存到 mix_<合集名>_<合集ID>/。默认关闭，避免改变已有用户目录。
     "legacy_layout": False,
+    # 合集编号/任务顺序：page 为网页列表顺序；另外支持发布时间升序/降序。
+    "mix_order": "page",
     # 作者目录层命名方式：
     #   "nickname"    - 作者昵称（默认，最直观，但重名会合并、改名会分裂）
     #   "sec_uid"     - 作者 sec_uid（稳定唯一，但不直观）

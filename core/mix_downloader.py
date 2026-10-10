@@ -25,7 +25,8 @@ from utils.naming import compact_legacy_label, episode_number_width
 logger = setup_logger("MixDownloader")
 
 _SCOPE_LABEL = "合集"
-_MIX_CACHE_VERSION = 1
+# v1 captured network arrival order without checking the collection DOM.
+_MIX_CACHE_VERSION = 2
 
 
 def derive_mix_collection_dir(mix_detail: Optional[Dict[str, Any]], mix_id: Any) -> str:
@@ -100,16 +101,20 @@ class MixDownloader(BaseDownloader):
             await self._save_mix_cache(str(mix_id), aweme_list, mix_detail)
 
         # The sequence is assigned before workers start, so concurrent
-        # completion order can never change filenames. Legacy mode matches the
-        # old downloader by numbering from the oldest publication forward.
+        # completion order can never change filenames. Layout and ordering are
+        # independent: page order is the default even for the legacy folders.
         legacy_layout = bool(self.config.get("legacy_layout", False))
-        if legacy_layout:
-            aweme_list = sorted(
-                (dict(item) for item in aweme_list),
+        mix_order = str(self.config.get("mix_order") or "page").strip().lower()
+        if mix_order not in {"page", "create_time_asc", "create_time_desc"}:
+            logger.warning("Invalid mix_order value: %s, using page", mix_order)
+            mix_order = "page"
+        aweme_list = [dict(item) for item in aweme_list]
+        if mix_order != "page":
+            aweme_list.sort(
                 key=lambda item: int(item.get("create_time") or 0),
+                reverse=mix_order == "create_time_desc",
             )
-        else:
-            aweme_list = [dict(item) for item in aweme_list]
+        logger.info("合集排序：mix_id=%s mix_order=%s items=%s", mix_id, mix_order, len(aweme_list))
         episode_width = episode_number_width(len(aweme_list))
         for episode_number, item in enumerate(aweme_list, start=1):
             item["_episode_number"] = episode_number

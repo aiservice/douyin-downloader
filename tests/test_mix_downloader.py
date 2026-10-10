@@ -1,4 +1,5 @@
 import errno
+import json
 
 import pytest
 
@@ -192,6 +193,7 @@ async def test_mix_legacy_layout_sorts_and_assigns_stable_episode_numbers(
     downloader = _make_mix_downloader(tmp_path, _LegacyAPI())
     downloader.config.update(
         legacy_layout=True,
+        mix_order="create_time_asc",
         filename_template="{episode_title}",
         folder_template="{episode_title}",
         mix_cache={"enabled": False},
@@ -222,6 +224,79 @@ async def test_mix_legacy_layout_sorts_and_assigns_stable_episode_numbers(
     assert [entry[2]["file_stem"] for entry in captured] == ["第01集：开场", "第02集：结尾"]
     assert all(entry[3]["output_root"] == "mix_2026大宅门_123" for entry in captured)
     assert all(entry[3]["collection_dir"] is None for entry in captured)
+
+
+@pytest.mark.parametrize("legacy_layout", [False, True])
+@pytest.mark.parametrize("from_cache", [False, True])
+@pytest.mark.parametrize(
+    "mix_order,expected_ids",
+    [
+        (None, ["1", "2", "3"]),
+        ("page", ["1", "2", "3"]),
+        ("create_time_asc", ["2", "3", "1"]),
+        ("create_time_desc", ["1", "3", "2"]),
+        ("invalid", ["1", "2", "3"]),
+    ],
+)
+async def test_mix_order_is_independent_of_layout_and_cache(
+    tmp_path, monkeypatch, legacy_layout, from_cache, mix_order, expected_ids
+):
+    items = [
+        {"aweme_id": "1", "desc": "第1集（补发）", "create_time": 300},
+        {"aweme_id": "2", "desc": "第2集", "create_time": 100},
+        {"aweme_id": "3", "desc": "第3集", "create_time": 200},
+    ]
+    detail = {"mix_name": "合集", "author": {"nickname": "作者"}}
+
+    class _API:
+        async def get_mix_aweme(self, _mix_id, cursor=0, count=20):
+            assert not from_cache, "cache hit must preserve page order without fetching"
+            return _page(items)
+
+        async def get_mix_detail(self, _mix_id):
+            return detail
+
+    downloader = _make_mix_downloader(tmp_path, _API())
+    downloader.config.update(legacy_layout=legacy_layout)
+    if mix_order is not None:
+        downloader.config.update(mix_order=mix_order)
+    if from_cache:
+        await downloader._save_mix_cache("123", items, detail)
+    captured = []
+
+    async def _always_true(*_args, **_kwargs):
+        return True
+
+    async def _capture(item, _author, **kwargs):
+        captured.append((item["aweme_id"], item["_episode_number"], kwargs))
+        return True
+
+    monkeypatch.setattr(downloader, "_should_download", _always_true)
+    monkeypatch.setattr(downloader, "_download_aweme_assets", _capture)
+
+    result = await downloader.download({"mix_id": "123"})
+
+    assert result.success == 3
+    assert [entry[0] for entry in captured] == expected_ids
+    assert [entry[1] for entry in captured] == [1, 2, 3]
+    assert downloader._mix_cache_hit is from_cache
+    assert all((entry[2]["output_root"] is not None) == legacy_layout for entry in captured)
+    assert all("_episode_number" not in item for item in items)
+    cached = await downloader._load_mix_cache("123")
+    assert [item["aweme_id"] for item in cached["items"]] == ["1", "2", "3"]
+
+
+async def test_mix_cache_v1_is_refreshed_without_deleting_old_cache(tmp_path):
+    downloader = _make_mix_downloader(tmp_path, _FakeAPIClient())
+    path = downloader._mix_cache_path("123")
+    path.parent.mkdir(parents=True)
+    path.write_text(json.dumps({
+        "version": 1, "mix_id": "123", "complete": True,
+        "items": [{"aweme_id": "1"}],
+    }), encoding="utf-8")
+
+    assert await downloader._load_mix_cache("123") is None
+    assert path.is_file()
 
 
 @pytest.mark.asyncio

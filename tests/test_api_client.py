@@ -17,6 +17,33 @@ def test_default_query_uses_existing_ms_token():
     assert params["msToken"] == "token-1"
 
 
+@pytest.mark.parametrize("include_session", [False, True])
+def test_browser_cookies_cover_douyin_subdomains_and_preserve_session_filter(include_session):
+    cookies = {name: "session-cookie" for name in DouyinAPIClient._BROWSER_COOKIE_BLOCKLIST}
+    cookies.update({"msToken": "token-1", "UIFID": "security-cookie"})
+    client = DouyinAPIClient(cookies)
+
+    payload = client._browser_cookie_payload(include_session=include_session)
+
+    expected_names = set(cookies) if include_session else {"msToken", "UIFID"}
+    assert {cookie["name"] for cookie in payload} == expected_names
+    for cookie in payload:
+        assert cookie == {
+            "name": cookie["name"],
+            "value": cookies[cookie["name"]],
+            "domain": ".douyin.com",
+            "path": "/",
+        }
+    assert client.cookies == cookies
+
+
+def test_browser_cookie_payload_accepts_empty_cookies():
+    client = DouyinAPIClient({})
+
+    assert client._browser_cookie_payload() == []
+    assert client._browser_cookie_payload(include_session=True) == []
+
+
 def test_build_signed_path_fallbacks_to_xbogus_when_abogus_disabled():
     client = DouyinAPIClient({"msToken": "token-1"})
     client._abogus_enabled = False
@@ -294,6 +321,9 @@ def test_video_browser_fallback_collects_page_owned_detail(monkeypatch):
 
 def test_browser_fallback_caps_warmup_wait(monkeypatch):
     class _FakeMouse:
+        async def move(self, _x, _y):
+            return
+
         async def wheel(self, _x, _y):
             return
 
@@ -408,13 +438,15 @@ def test_browser_fallback_caps_warmup_wait(monkeypatch):
     assert client.pop_browser_post_stats() == {}
 
 
-def test_post_browser_limit_uses_filtered_candidates(monkeypatch):
+@pytest.mark.parametrize("verification_required", [False, True])
+def test_post_browser_limit_uses_filtered_candidates(monkeypatch, verification_required):
     first = {"aweme_id": "7670000000000000001", "create_time": 500}
     second = {"aweme_id": "7670000000000000002", "create_time": 300}
+    captured_cookies = []
 
     class _FakeResponse:
-        def __init__(self, item):
-            self.url = "https://www.douyin.com/aweme/v1/web/aweme/post/"
+        def __init__(self, item, host="www.douyin.com"):
+            self.url = f"https://{host}/aweme/v1/web/aweme/post/"
             self._item = item
 
         async def json(self):
@@ -424,11 +456,39 @@ def test_post_browser_limit_uses_filtered_candidates(monkeypatch):
         def __init__(self, page):
             self.page = page
             self.scrolls = 0
+            self.moves = []
+
+        async def move(self, x, y):
+            self.moves.append((x, y))
 
         async def wheel(self, _x, _y):
+            assert self.page.save_prompt is False
+            assert self.page.verification_required is False
+            assert self.moves, "The pointer must be moved into the works area before scrolling"
             self.scrolls += 1
             if self.scrolls == 1:
-                self.page._response_handler(_FakeResponse(second))
+                self.page._response_handler(_FakeResponse(second, host="www-hj.douyin.com"))
+                self.page.save_prompt = True
+
+    class _Locator:
+        def __init__(self, page, text):
+            self.page = page
+            self.text = text
+
+        @property
+        def first(self):
+            return self
+
+        async def count(self):
+            return int(self.page.save_prompt and self.text in {"是否保存登录信息", "取消"})
+
+        async def is_visible(self):
+            return bool(await self.count())
+
+        async def click(self, **_kwargs):
+            assert self.text == "取消"
+            self.page.save_prompt = False
+            self.page.cancel_clicks += 1
 
     class _FakePage:
         url = "https://www.douyin.com/user/sec_uid_x"
@@ -436,6 +496,13 @@ def test_post_browser_limit_uses_filtered_candidates(monkeypatch):
         def __init__(self):
             self._response_handler = None
             self.mouse = _FakeMouse(self)
+            self.verification_required = verification_required
+            self.save_prompt = not verification_required
+            self.cancel_clicks = 0
+            self.verification_waits = 0
+
+        def get_by_text(self, text, **_kwargs):
+            return _Locator(self, text)
 
         def on(self, event_name, callback):
             if event_name == "response":
@@ -445,7 +512,7 @@ def test_post_browser_limit_uses_filtered_candidates(monkeypatch):
             self._response_handler(_FakeResponse(first))
 
         async def title(self):
-            return "作者主页"
+            return "安全验证" if self.verification_required else "作者主页"
 
         async def evaluate(self, _script):
             return ""
@@ -461,7 +528,7 @@ def test_post_browser_limit_uses_filtered_candidates(monkeypatch):
             self.page = page
 
         async def add_cookies(self, _cookies):
-            return None
+            captured_cookies.extend(_cookies)
 
         async def new_page(self):
             return self.page
@@ -508,12 +575,23 @@ def test_post_browser_limit_uses_filtered_candidates(monkeypatch):
     monkeypatch.setitem(sys.modules, "playwright", fake_playwright_pkg)
     monkeypatch.setitem(sys.modules, "playwright.async_api", fake_async_api)
 
-    client = DouyinAPIClient({"msToken": "token"})
+    client = DouyinAPIClient(
+        {"msToken": "token", "sessionid": "session-cookie", "UIFID": "security-cookie"}
+    )
 
     async def _no_dom_ids(_page):
         return []
 
+    async def _manual_verification(_page, **_kwargs):
+        assert _page.verification_required is True
+        assert _page.cancel_clicks == 0
+        _page.verification_waits += 1
+        _page.verification_required = False
+        _page.save_prompt = True
+        return True
+
     monkeypatch.setattr(client, "_extract_aweme_ids_from_page", _no_dom_ids)
+    monkeypatch.setattr(client, "_wait_for_manual_verification", _manual_verification)
     ids = asyncio.run(
         client.collect_user_post_ids_via_browser(
             "sec_uid_x",
@@ -521,7 +599,7 @@ def test_post_browser_limit_uses_filtered_candidates(monkeypatch):
             candidate_filter=lambda items: [
                 item for item in items if int(item.get("create_time") or 0) <= 300
             ],
-            headless=True,
+            headless=not verification_required,
             max_scrolls=5,
             idle_rounds=2,
             wait_timeout_seconds=30,
@@ -530,13 +608,23 @@ def test_post_browser_limit_uses_filtered_candidates(monkeypatch):
 
     assert ids == [first["aweme_id"], second["aweme_id"]]
     assert page.mouse.scrolls == 1
+    assert page.mouse.moves == [(850, 550)]
+    assert page.cancel_clicks == 2
+    assert page.save_prompt is False
+    assert page.verification_waits == int(verification_required)
+    for name in ("sessionid", "UIFID"):
+        cookie = next(cookie for cookie in captured_cookies if cookie["name"] == name)
+        assert cookie["domain"] == ".douyin.com"
+        assert cookie["path"] == "/"
+        assert "url" not in cookie
     stats = client.pop_browser_post_stats()
     assert stats["candidate_items"] == 1
 
 
 @pytest.mark.parametrize("redirected,detail_last", [(False, False), (True, False), (True, True)])
+@pytest.mark.parametrize("dom_order", ["none", "full", "partial"])
 def test_mix_browser_fallback_collects_page_owned_responses(
-    monkeypatch, redirected, detail_last
+    monkeypatch, redirected, detail_last, dom_order
 ):
     item_1 = {"aweme_id": "7600224486650121888", "desc": "one"}
     item_2 = {"aweme_id": "7600224486650121889", "desc": "two"}
@@ -636,6 +724,15 @@ def test_mix_browser_fallback_collects_page_owned_responses(
         async def title(self):
             return "浏览器合集 - 抖音"
 
+        async def evaluate(self, script, *_args):
+            if "li img[alt]" in script:
+                if dom_order == "full":
+                    return [item_2["aweme_id"], "999", item_1["aweme_id"]]
+                if dom_order == "partial":
+                    return [item_2["aweme_id"]]
+                return []
+            return None
+
         def is_closed(self):
             return False
 
@@ -705,9 +802,9 @@ def test_mix_browser_fallback_collects_page_owned_responses(
         )
     )
 
+    expected = [item_2, item_1] if dom_order == "full" else [item_1, item_2]
     assert [item["aweme_id"] for item in result["items"]] == [
-        "7600224486650121888",
-        "7600224486650121889",
+        item["aweme_id"] for item in expected
     ]
     assert result["mix_detail"]["mix_name"] == "浏览器合集"
     assert result["mix_detail"]["mix_id"] == actual_mix_id
@@ -753,6 +850,35 @@ def test_redirected_video_mix_detail_preserves_mix_and_author():
     assert "author" not in payload["aweme_detail"]["mix_info"]
 
 
+@pytest.mark.parametrize(
+    "dom_ids,expected",
+    [(["111", "111", None, "222"], ["111", "222"]), (None, []), ({"id": "111"}, [])],
+)
+async def test_collection_dom_ids_are_deduplicated_and_scoped(dom_ids, expected):
+    class _Page:
+        async def evaluate(self, script, mix_name):
+            assert "li img[alt]" in script
+            assert "image.closest('li')" in script
+            assert "alt.includes(mixName)" in script
+            assert "document.documentElement" not in script
+            assert mix_name == "目标合集"
+            return dom_ids
+
+    client = DouyinAPIClient({"msToken": "token-1"})
+    assert await client._extract_mix_aweme_ids_from_page(
+        _Page(), mix_name="目标合集"
+    ) == expected
+
+
+async def test_collection_dom_extraction_failure_keeps_api_order():
+    class _Page:
+        async def evaluate(self, *_args):
+            raise RuntimeError("closed")
+
+    client = DouyinAPIClient({"msToken": "token-1"})
+    assert await client._extract_mix_aweme_ids_from_page(_Page()) == []
+
+
 def test_mix_browser_fallback_dismisses_save_login_prompt():
     clicks = []
 
@@ -782,6 +908,52 @@ def test_mix_browser_fallback_dismisses_save_login_prompt():
 
     assert dismissed is True
     assert clicks == [{"timeout": 5_000, "force": True}]
+
+
+@pytest.mark.parametrize("position", [{"x": 920, "y": 640}, None, "", "error"])
+async def test_user_post_scroll_targets_works_container_and_moves_pointer(position):
+    events = []
+
+    class _Mouse:
+        async def move(self, x, y):
+            events.append(("move", x, y))
+
+        async def wheel(self, x, y):
+            events.append(("wheel", x, y))
+
+    class _Page:
+        mouse = _Mouse()
+
+        async def evaluate(self, script):
+            assert ".route-scroll-container" in script
+            assert "scrollTop = container.scrollHeight" in script
+            assert "document.scrollingElement" in script
+            if position == "error":
+                raise RuntimeError("page is navigating")
+            return position
+
+    client = DouyinAPIClient({})
+    await client._scroll_user_post_page(_Page())
+
+    expected_position = (920, 640) if isinstance(position, dict) else (850, 550)
+    assert events == [("move", *expected_position), ("wheel", 0, 3800)]
+
+
+async def test_browser_interstitial_dismissal_does_not_cancel_security_verification():
+    class _Locator:
+        @property
+        def first(self):
+            return self
+
+        async def count(self):
+            return 0
+
+    class _Page:
+        def get_by_text(self, text, **_kwargs):
+            assert text == "是否保存登录信息"
+            return _Locator()
+
+    assert await DouyinAPIClient({})._dismiss_browser_interstitials(_Page()) is False
 
 
 def test_manual_verification_waits_until_blocker_disappears(monkeypatch):

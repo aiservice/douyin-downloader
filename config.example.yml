@@ -23,8 +23,16 @@ folderstyle: true
 filename_template: "{date}_{title}_{id}"
 folder_template: "{date}_{title}_{id}"
 
-# 兼容旧版单合集目录与排序：mix_<合集名>_<合集ID>/，按发布时间从早到晚编号。
+# 兼容旧版单合集目录：mix_<合集名>_<合集ID>/，不影响下方排序方式。
 legacy_layout: false
+
+# 合集文件编号及下载任务顺序，与目录布局无关：
+#   page             - 按网页 HTML 合集列表顺序（默认）
+#   create_time_asc  - 按发布时间从早到晚（原 legacy_layout 的排序方式）
+#   create_time_desc - 按发布时间从晚到早
+# 浏览器采集会读取合集 DOM 顺序；无法读取 DOM 时保留接口列表顺序。
+# thread > 1 时完成顺序可能不同，但文件名序号不受影响。
+mix_order: page
 
 # 作者目录层命名方式。可选值：
 #   nickname     - 仅作者昵称（默认，最直观，但重名会合并、改名会分裂）

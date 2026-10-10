@@ -3,6 +3,40 @@ import pytest
 from config import ConfigLoader
 
 
+def test_mix_order_defaults_to_page():
+    assert ConfigLoader().get("mix_order") == "page"
+
+
+def test_mix_order_env_overrides_file_and_is_persisted(tmp_path, monkeypatch):
+    config_file = tmp_path / "config.yml"
+    config_file.write_text("mix_order: create_time_asc\n", encoding="utf-8")
+    monkeypatch.setenv("DOUYIN_MIX_ORDER", "create_time_desc")
+    loader = ConfigLoader(str(config_file))
+
+    assert loader.get("mix_order") == "create_time_desc"
+    assert loader.save() is True
+    monkeypatch.delenv("DOUYIN_MIX_ORDER")
+    assert ConfigLoader(str(config_file)).get("mix_order") == "create_time_desc"
+
+
+@pytest.mark.parametrize(
+    "value,expected",
+    [
+        ("page", "page"),
+        ("create_time_asc", "create_time_asc"),
+        ("CREATE_TIME_DESC ", "create_time_desc"),
+        ("invalid", "page"),
+        (None, "page"),
+    ],
+)
+def test_mix_order_validation(value, expected):
+    loader = ConfigLoader()
+    loader.update(link=["https://www.douyin.com/collection/123"], mix_order=value)
+
+    assert loader.validate() is True
+    assert loader.get("mix_order") == expected
+
+
 def test_incremental_download_defaults_to_disk_dedupe_for_supported_modes():
     loader = ConfigLoader()
 

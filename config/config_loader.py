@@ -62,6 +62,8 @@ class ConfigLoader:
                 )
         if os.getenv("DOUYIN_PROXY"):
             env_config["proxy"] = os.getenv("DOUYIN_PROXY")
+        if os.getenv("DOUYIN_MIX_ORDER"):
+            env_config["mix_order"] = os.getenv("DOUYIN_MIX_ORDER")
         return env_config
 
     def _normalize_mix_aliases(
@@ -174,6 +176,7 @@ class ConfigLoader:
         "filename_template",
         "folder_template",
         "legacy_layout",
+        "mix_order",
         "video_quality",
         "comments",
         "mix_cache",
@@ -344,6 +347,12 @@ class ConfigLoader:
             return False
         if not self.config.get("path"):
             return False
+
+        mix_order = str(self.config.get("mix_order") or "page").strip().lower()
+        if mix_order not in {"page", "create_time_asc", "create_time_desc"}:
+            logger.warning("Invalid mix_order value: %s, using page", mix_order)
+            mix_order = "page"
+        self.config["mix_order"] = mix_order
 
         thread = self.config.get("thread")
         if thread is not None:

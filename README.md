@@ -473,7 +473,8 @@ pytest -q
 | `start_time` / `end_time` | Time filter (format: `YYYY-MM-DD`) |
 | `folderstyle` | Create per-item subdirectories |
 | `filename_template` / `folder_template` | File/folder templates; collections support `{episode}` (zero-padded index) and `{episode_title}` (`第001集：Title`) |
-| `legacy_layout` | Original direct-collection layout, ordered oldest-first under `mix_<name>_<mix_id>/` |
+| `legacy_layout` | Original direct-collection folder layout under `mix_<name>_<mix_id>/`; independent of ordering |
+| `mix_order` | Collection numbering/task order: `page` (default), `create_time_asc`, or `create_time_desc` |
 | `mix_cache.*` | Complete collection-list cache; defaults to 24 hours and avoids reopening the browser on a hit |
 | `browser_fallback.*` | Real-browser fallback for single works, restricted `post` pagination and collection URLs |
 | `progress.quiet_logs` | Quiet logs during progress stage |
@@ -494,6 +495,16 @@ With `legacy_layout: true` and `filename_template: "{episode_title}"`, direct
 collections use `Downloaded/mix_<name>_<mix_id>/第001集：Title.mp4`. The index
 uses two digits below 100 items and grows to three digits at 100 items. Complete
 list caches are stored in `Downloaded/.cache/mix/<mix_id>.json`.
+
+Collections now default to `mix_order: page`, including when `legacy_layout` is
+enabled. The browser collector reads the collection list's HTML order, excluding
+recommendations. Items not present in the DOM (or direct API downloads without a
+browser) keep the API list order. Use `mix_order: create_time_asc` to restore the
+previous oldest-publication-first behavior, or `create_time_desc` for newest first.
+Numbering is assigned before concurrent downloads start; `thread: 1` also makes
+the download execution sequential. Existing videos are not renamed automatically.
+Old v1 list caches are refreshed once because they did not verify the HTML order;
+new caches retain page order and can be reused with any `mix_order` setting.
 
 Default with `folderstyle: true` and `database_path: dy_downloader.db`:
 
